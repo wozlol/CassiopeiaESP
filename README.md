@@ -15,11 +15,12 @@ This is a personal hobby project for my own devices and my own computers. It is 
 7. [The helper on your computers](#the-helper-on-your-computers)
 8. [The SD card and the library](#the-sd-card-and-the-library)
 9. [The reader](#the-reader)
-10. [Remote access with Tailscale, step by step](#remote-access-with-tailscale-step-by-step)
-11. [Making your own packs](#making-your-own-packs)
-12. [Problems and fixes](#problems-and-fixes)
-13. [Safety notes](#safety-notes)
-14. [Repository layout](#repository-layout)
+10. [Update the card over Wi-Fi, sync mode](#update-the-card-over-wi-fi-sync-mode)
+11. [Remote access with Tailscale, step by step](#remote-access-with-tailscale-step-by-step)
+12. [Making your own packs](#making-your-own-packs)
+13. [Problems and fixes](#problems-and-fixes)
+14. [Safety notes](#safety-notes)
+15. [Repository layout](#repository-layout)
 
 ## What is in the box
 
@@ -40,7 +41,7 @@ This is a personal hobby project for my own devices and my own computers. It is 
 | Pairing a computer by matching a code on both screens | Zoom and pan in the picture viewer, manual packs with page pictures |
 | Library list, search, scroll bar | Tap and hold on links, find as you type, copy and paste in the reader |
 | Theme editor | The star effect for GUI plus Esc, brightness key and Off in the loader |
-| Installing modes from the SD card in the loader | Get files from the computer |
+| Installing modes from the SD card in the loader | Get files from the computer, Wi-Fi sync mode, the loader suggesting the slot with the same name |
 
 Anything in the right column is a test build until it is checked on hardware. See `Firmware/README.txt` for the exact build.
 
@@ -88,7 +89,7 @@ Wi-Fi, saved computers, your encrypted key, themes and the clipboard live in the
 
 Press 1 to 4 to start the mode in that slot. Up and Down move, Enter starts. Press T for the theme list. The brightness key steps the screen down through six levels and wraps. Off sleeps the whole device and On wakes it into the loader.
 
-Install a mode from the SD card: put the file in `modes` on the card, pick it in the install list, press Enter, then press the slot number. File names keep the same names as the project: `mode1.bin`, `reader.bin`, `media.bin`. A new file with the same name replaces the old one in the slot you choose.
+Install a mode from the SD card: put the file in `modes` on the card, pick it in the install list, press Enter, then press the slot number. File names keep the same names as the project: `mode1.bin`, `reader.bin`, `media.bin`. A file named like a mode goes back into the slot that holds that mode. When you pick `reader.bin` and the reader is in slot 2, the bottom line says it matches slot 2 and Enter puts it there. You can still press 1 to 4 for another slot.
 
 From any mode, hold GUI and Esc to go back to the loader. A short star field plays in your theme colors while you hold. Let go early to stay. Holding GUI while pressing On or while resetting also goes to the loader. If a mode crashes three times in a row, the loader starts by itself.
 
@@ -127,7 +128,7 @@ Options: `-start FOLDER` is where new sessions begin and defaults to your home f
 
 Type these in the helper window: `y` or `n` answers a pairing request, `devices` lists paired handhelds, `revoke NAME` removes one, `web` prints a link to the history page, `quit` stops it.
 
-Other commands: `a11helper send FILE [modes|library|media]` copies a file into the drop folder for the handheld. `a11helper history [NAME [LINES]]` prints a session's history.
+Other commands: `a11helper send FILE [modes|library|media]` copies a file into the drop folder for the handheld. `a11helper history [NAME [LINES]]` prints a session's history. `a11helper sync-do ...` works the handheld while it is in sync mode, see the next sections.
 
 ### Pairing
 
@@ -195,6 +196,47 @@ Open Library. Enter opens a pack or a file. Inside a pack, the top line is the s
 | Scroll bar | The strip on the right edge. Drag it to jump. |
 | Picture | Tap or Enter zooms in and back. Plus and minus change the zoom. Drag or the arrows move around. Esc, Backspace or holding a finger down closes. |
 | T | Next theme. |
+
+## Update the card over Wi-Fi, sync mode
+
+Sync mode lets your computer, or Claude working on it, change the card and the clipboard without taking the card out and without plugging in a cable. It works at home and through Tailscale. The handheld makes the connection, so nothing on the handheld listens, and it is off unless you open it.
+
+1. Make sure the helper is running on the computer you want to use.
+2. On the handheld: GUI menu, Sync with the computer. It connects to the computer in use and shows Connected. The screen stays on and the handheld does not sleep while it is open. Esc ends it.
+3. On the computer, in another window, use `a11helper sync-do`. If the handheld is not in sync mode, the command says so.
+
+| Command | Does |
+|---|---|
+| `a11helper sync-do status` | Says whether the handheld is in sync mode. |
+| `a11helper sync-do put FILE CARDPATH` | Sends one file. If the link drops, run it again and it carries on from where it stopped. |
+| `a11helper sync-do putdir FOLDER CARDFOLDER` | Sends every file in a folder that is missing on the card or a different size. |
+| `a11helper sync-do get CARDPATH FILE` | Takes a file from the card. |
+| `a11helper sync-do list CARDFOLDER` | Lists the files and sizes under a folder on the card. |
+| `a11helper sync-do rm CARDPATH` and `rmdir CARDFOLDER` | Deletes a file, or a folder with everything in it. |
+| `a11helper sync-do clip list` | Shows the handheld's clipboard, numbered from 1. |
+| `a11helper sync-do clip add TEXT`, `del N`, `set N TEXT` | Adds, deletes or changes a clip. |
+| `a11helper sync-do install CARDFILE SLOT` | Installs a mode file already on the card into slot 1 to 4. |
+
+Card paths start with `modes/`, `library/` or `media/`. Anything else is refused, and so is any path with `..` in it.
+
+Updating a mode, using the names the loader recognizes:
+
+```
+a11helper sync-do put reader.bin modes/reader.bin
+a11helper sync-do install modes/reader.bin 2
+```
+
+The handheld cannot overwrite the slot it is running from. While you are in Mode 1 you can install into slots 2 to 4. To update Mode 1 itself, send the file, then GUI menu, Back to the loader, pick `mode1.bin`, and press Enter. The loader sees the name matches slot 1.
+
+Adding a pack to the library:
+
+```
+a11helper sync-do putdir ~/a11-staging/packs/honda-fit-2015-manual library/honda-fit-2015-manual
+```
+
+Over Wi-Fi this is slow for big packs. The first fill of a card with tens of gigabytes belongs in a card reader. Sync mode is for updates, new manuals, one mode at a time, the clipboard, and anything you want to do without opening the Casio.
+
+Away from home it is the same: with Tailscale joined and the away address set, the handheld connects out through the tunnel, and the same commands work on the computer. The Status screen shows which route was used.
 
 ## Remote access with Tailscale, step by step
 
@@ -325,6 +367,8 @@ Run the tools with a Python that has Pillow, libzim and cairosvg. Pictures are s
 | Find does not list a computer | The firewall blocks the broadcast | Press A again on the empty slot and type the address. |
 | Tailscale stays at Joining | The key is wrong, spent or expired | Make a new key and join again. |
 | Tailscale says the key was refused | Same | Same. |
+| Sync command says the handheld is not in sync mode | The handheld is not on the Sync screen, or it connected to a different computer | Open GUI menu, Sync with the computer, and check which computer is in use. |
+| Install says the slot is running | You asked it to overwrite the mode it is running from | Use the loader for that one. |
 | Away connect works at home but not on the hotspot | The hotspot is 5 GHz only, or Tailscale on the computer is stopped | Turn on Maximize Compatibility, and check Tailscale on the computer. |
 | Connect works from the Mac but the handheld times out | The access rule does not allow port 2222 for `tag:casio` | Check Part 2 and the tag on the handheld. |
 | A pack is missing from search | It is not in `library`, or it has no `pack.txt` | Check the folder and run the sync again. |

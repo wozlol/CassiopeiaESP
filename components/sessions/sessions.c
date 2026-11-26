@@ -10,6 +10,7 @@
 #include "ssh_client.h"
 #include "esp_heap_caps.h"
 #include <sys/stat.h>
+#include "syncd.h"
 #include "vterm.h"
 #include "status_led.h"
 
@@ -105,6 +106,7 @@ void sess_drop_progress(long *got, long *total) { if (got) *got = drop_got; if (
 bool sess_drop_ok(void) { return drop_ok; }
 
 static void sink_data(const char *buf, size_t len, void *u) {
+    if (kind == SESS_SYNC) { syncd_feed(buf, len); return; }
     if (kind == SESS_DROPGET) { drop_data(buf, len); return; }
     if (kind == SESS_CAPTURE || kind == SESS_DROPLIST) { hist_add(buf, len); return; }
     if (kind == SESS_ATTACH) { vterm_feed(buf, len); status_led_output(); }
@@ -177,6 +179,7 @@ void sess_begin(sess_kind_t k, const char *arg) {
         if (k == SESS_ATTACH) { snprintf(cmd, sizeof cmd, "attach %s", arg); snprintf(attached, sizeof attached, "%s", arg); }
         else if (k == SESS_KILL) snprintf(cmd, sizeof cmd, "kill %s", arg);
         else if (k == SESS_CAPTURE) snprintf(cmd, sizeof cmd, "capture %s 2000", arg);
+        else if (k == SESS_SYNC) snprintf(cmd, sizeof cmd, "sync");
         else if (k == SESS_DROPLIST) snprintf(cmd, sizeof cmd, "drop list");
         else if (k == SESS_DROPGET) { drop_reset(); snprintf(drop_path, sizeof drop_path, "%.159s", arg); snprintf(cmd, sizeof cmd, "drop get %s", arg); }
         else snprintf(cmd, sizeof cmd, "list");
@@ -196,6 +199,7 @@ sess_state_t sess_poll(void) {
             esp_err_t rc = ssh_client_connect_take_result();
             if (rc == ESP_OK) {
                 state = SESS_ACTIVE;
+                if (kind == SESS_SYNC) syncd_begin("casio");
                 snprintf(fp_seen, sizeof fp_seen, "%s", ssh_client_get_fingerprint());
                 if (kind == SESS_PAIR) deadline = esp_timer_get_time() + PAIR_WAIT_US;   // waiting for a person to say yes
             } else if (rc == SSH_ERR_HOSTKEY_UNKNOWN && kind == SESS_PAIR) {
@@ -232,6 +236,7 @@ sess_state_t sess_poll(void) {
 }
 
 void sess_end(void) {
+    if (kind == SESS_SYNC) syncd_end();
     if (ssh_client_connect_pending()) ssh_client_connect_cancel();
     if (ssh_client_is_connected()) ssh_client_disconnect();
     state = SESS_IDLE;

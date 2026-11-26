@@ -13,7 +13,7 @@ typedef enum {
     SESS_ERROR,
 } sess_state_t;
 
-typedef enum { SESS_ATTACH, SESS_LIST, SESS_PAIR, SESS_KILL, SESS_CAPTURE, SESS_DROPLIST, SESS_DROPGET } sess_kind_t;
+typedef enum { SESS_ATTACH, SESS_LIST, SESS_PAIR, SESS_KILL, SESS_CAPTURE, SESS_DROPLIST, SESS_DROPGET, SESS_SYNC } sess_kind_t;
 
 typedef struct {
     char name[41];

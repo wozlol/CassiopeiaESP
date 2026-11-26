@@ -32,7 +32,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const version = "0.5"
+const version = "0.6"
 
 var hostPub ssh.PublicKey
 var devStore *Store
@@ -348,6 +348,9 @@ func run(ch ssh.Channel, args []string, pr *ptyReq, ptmx **os.File, mu *sync.Mut
 		say("no command")
 		return 2
 	}
+	if args[0] == "sync" && !pairOnly {
+		return syncSession(ch, dev)
+	}
 	if args[0] == "drop" && !pairOnly {
 		return dropCmd(ch, args[1:], say, dev)
 	}
@@ -509,6 +512,11 @@ func main() {
 		return
 	}
 
+	// a11helper sync-do ...: talks to the running helper while the handheld is in sync mode
+	if a := flag.Args(); len(a) >= 1 && a[0] == "sync-do" {
+		os.Exit(syncCLI(dir, a[1:]))
+	}
+
 	// a11helper send FILE [modes|library|media]: put a file where the handheld can pull it
 	if a := flag.Args(); len(a) >= 1 && a[0] == "send" {
 		sendCLI(a[1:])
@@ -523,6 +531,7 @@ func main() {
 		fatal(fmt.Errorf("the start folder %q does not exist", startDir))
 	}
 	initDrop(*dropFlag)
+	go syncControl(dir)
 	// a11helper history [NAME [LINES]]: read tmux history from this computer's terminal
 	if a := flag.Args(); len(a) >= 1 && a[0] == "history" {
 		historyCLI(a[1:])

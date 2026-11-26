@@ -2,6 +2,7 @@
 // the ota_0 or ota_1 slot, checks them first, and boots a slot. Serial commands: list, install <file> <slot>, boot <slot>.
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -404,6 +405,19 @@ static void scan_files(void) {
     closedir(dir);
 }
 
+// A file named like a mode goes back into the slot that mode is in. mode1.bin matches the slot running mode1, and so on.
+static int suggest_slot(const char *file) {
+    char stem[48];
+    snprintf(stem, sizeof stem, "%.47s", file);
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = 0;
+    for (int i = 0; i < NSLOTS; i++) {
+        const esp_partition_t *p = slot_by_name(SLOT_NAMES[i]);
+        esp_app_desc_t d;
+        if (p && esp_ota_get_partition_description(p, &d) == ESP_OK && strcasecmp(d.project_name, stem) == 0) return i;
+    }
+    return -1;
+}
 // The loader wears the same theme as the other modes, from the same saved setting. T opens the list.
 static bool theme_mode;
 static int theme_sel, theme_saved;
@@ -451,7 +465,9 @@ static void draw(void) {
     put(18, 0, m, false);
     if (pending >= 0) {
         char h[160];
-        snprintf(h, sizeof h, " Put %.26s in slot?  1 2 3 4   Esc stops", files[pending]);
+        int sg = suggest_slot(files[pending]);
+        if (sg >= 0) snprintf(h, sizeof h, " %.20s matches slot %d.  Enter puts it there  or 1-4  Esc stops", files[pending], sg + 1);
+        else snprintf(h, sizeof h, " Put %.26s in slot?  1 2 3 4   Esc stops", files[pending]);
         put(19, 0, h, true);
     } else if (sel < NSLOTS) put(19, 0, " Enter or 1-4 starts   Up Down move   r rescan   t theme", true);
     else put(19, 0, " Enter installs   Up Down move   r rescan", true);
@@ -523,6 +539,13 @@ static void ui_task(void *arg) {
                 draw();
                 vTaskDelay(pdMS_TO_TICKS(50));
                 cmd_install(files[pending], SLOT_NAMES[ev.code - 30]);
+                pending = -1;
+            } else if (ev.code == 40 && suggest_slot(files[pending]) >= 0) {   // Enter takes the slot with the same name
+                int sg = suggest_slot(files[pending]);
+                snprintf(last_msg, sizeof last_msg, "Installing %s in slot %d ...", files[pending], sg + 1);
+                draw();
+                vTaskDelay(pdMS_TO_TICKS(50));
+                cmd_install(files[pending], SLOT_NAMES[sg]);
                 pending = -1;
             } else if (ev.code == 41) pending = -1;
         } else if (ev.code >= 30 && ev.code < 30 + NSLOTS) {

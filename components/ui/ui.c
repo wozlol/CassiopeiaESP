@@ -9,6 +9,7 @@
 #include "a11_font.h"
 #include "clipboard.h"
 #include "tunnel.h"
+#include "syncd.h"
 #include "display.h"
 #include "esp_heap_caps.h"
 #include "esp_littlefs.h"
@@ -45,10 +46,10 @@
 #define HID_DOWN 81
 #define HID_UP 82
 
-typedef enum { UI_OFF, UI_MENU, UI_CLIP, UI_CLIP_NEW, UI_GRAB, UI_STATUS, UI_WIFI, UI_INPUT, UI_PC, UI_FIND, UI_SESS, UI_BUSY, UI_MSG, UI_CONFIRM, UI_SEC, UI_SEC_CAPTURE, UI_LOCK, UI_CLIP_EDIT, UI_BATT, UI_HIST, UI_DROP, UI_THEMED, UI_THEME_LOAD, UI_TS } ui_state_t;
-enum { M_SESS, M_CLIP, M_WIFI, M_PC, M_THEME, M_THEMED, M_TS, M_FONT, M_BRIGHT, M_BG, M_CAPSKEY, M_DROP, M_BATT, M_SEC, M_STATUS, M_LOADER, M_COUNT };
+typedef enum { UI_OFF, UI_MENU, UI_CLIP, UI_CLIP_NEW, UI_GRAB, UI_STATUS, UI_WIFI, UI_INPUT, UI_PC, UI_FIND, UI_SESS, UI_BUSY, UI_MSG, UI_CONFIRM, UI_SEC, UI_SEC_CAPTURE, UI_LOCK, UI_CLIP_EDIT, UI_BATT, UI_HIST, UI_DROP, UI_THEMED, UI_THEME_LOAD, UI_TS, UI_SYNC } ui_state_t;
+enum { M_SESS, M_CLIP, M_WIFI, M_PC, M_THEME, M_THEMED, M_TS, M_FONT, M_BRIGHT, M_BG, M_CAPSKEY, M_DROP, M_SYNC, M_BATT, M_SEC, M_STATUS, M_LOADER, M_COUNT };
 typedef enum { IN_WIFI_PASS, IN_PC_HOST, IN_SESS_NAME, IN_PIN_NEW, IN_PIN_CONFIRM, IN_PC_AWAY, IN_THEME_NAME, IN_TS_KEY } input_kind_t;
-typedef enum { BUSY_WIFI, BUSY_FIND, BUSY_LIST, BUSY_PAIR, BUSY_ATTACH, BUSY_KILL, BUSY_HIST, BUSY_DROPLIST, BUSY_DROPGET } busy_t;
+typedef enum { BUSY_WIFI, BUSY_FIND, BUSY_LIST, BUSY_PAIR, BUSY_ATTACH, BUSY_KILL, BUSY_HIST, BUSY_DROPLIST, BUSY_DROPGET, BUSY_SYNC } busy_t;
 
 static const char *TAG = "ui";
 static const int BRIGHT[] = {10, 25, 40, 60, 80, 100};
@@ -234,6 +235,9 @@ static void draw_batt(void);
 static void draw_drop(void);
 static void draw_themed(void);
 static void draw_ts(void);
+static void draw_sync(void);
+static void key_sync(uint16_t code);
+static void sync_enter(void);
 static void key_ts(uint16_t code);
 static int ts_sel;
 static void key_themed(uint16_t code);
@@ -319,6 +323,7 @@ static void draw_menu(void) {
     snprintf(ts_line, sizeof ts_line, "Tailscale   %s", tunnel_state_text());
     items[M_TS] = ts_line;
     items[M_DROP] = "Get files from the computer";
+    items[M_SYNC] = "Sync with the computer";
     items[M_BATT] = "Battery and power";
     items[M_SEC] = "Security";
     items[M_STATUS] = "Status";
@@ -658,6 +663,52 @@ static void reattach(void) {
     sess_end();
     sess_set_target(pc.host, pc.port, pc.fp);
     sess_begin(SESS_ATTACH, last_session);
+}
+
+// ---------- Sync mode ----------
+// While this screen is open the handheld stays connected to the computer in use, and the computer can send files, take files, delete files,
+// manage the clipboard and install firmware into a slot. Nothing listens here, the handheld made the connection. Esc ends it.
+static void sync_enter(void) {
+    if (net_state() != NET_CONNECTED) { msg_show(UI_MENU, "Wi-Fi is not connected. Open the GUI menu, Wi-Fi, and join a network"); return; }
+    if (!pc.fp[0]) { msg_show(UI_MENU, "Not paired with a computer yet. Open the GUI menu, Computer, and press A to pair"); return; }
+    if (!sdcard_mount()) { msg_show(UI_MENU, "No SD card, or it is not FAT32. Put in a FAT32 card and try again"); return; }
+    sess_end();
+    sess_set_target(pc.host, pc.port, pc.fp);
+    sess_begin(SESS_SYNC, NULL);
+    if (sess_state() == SESS_ERROR) { msg_show(UI_MENU, "%s", sess_error()); return; }
+    busy_kind = BUSY_SYNC;
+    snprintf(busy_msg, sizeof busy_msg, "Connecting to %.30s for sync ...", pc.name);
+    state = UI_BUSY;
+}
+static void draw_sync(void) {
+    ov_clear();
+    const char *hint = " Esc ends sync";
+    int end = orows - foot_h(hint);
+    int r = header("Sync with the computer") + 1;
+    char b[240], nm[100];
+    long done = 0, total = 0;
+    snprintf(b, sizeof b, " Connected to %s, %s", pc.name, sess_via_away() ? "through Tailscale" : "at home");
+    r = ov_text(r, 0, b, end);
+    snprintf(b, sizeof b, " Commands done  %d", syncd_ops());
+    r = ov_text(r, 0, b, end);
+    snprintf(b, sizeof b, " Last           %s", syncd_last());
+    r = ov_text(r + 1, 0, b, end);
+    if (syncd_transfer(nm, sizeof nm, &done, &total)) {
+        snprintf(b, sizeof b, " Now            %s", nm);
+        r = ov_text(r, 0, b, end);
+        int pct = total > 0 ? (int)(done * 100 / total) : 0;
+        char bar[33];
+        for (int i = 0; i < 32; i++) bar[i] = i < pct * 32 / 100 ? '#' : '-';
+        bar[32] = 0;
+        snprintf(b, sizeof b, " [%s] %d%%  %ld of %ld KB", bar, pct, done / 1024, total / 1024);
+        r = ov_text(r, 0, b, end);
+    }
+    r = ov_text(r + 1, 0, " Keep this screen open while the computer works. On the computer: a11helper sync-do status", end);
+    footer(hint);
+}
+static void key_sync(uint16_t code) {
+    if (code == HID_ESC) { sess_end(); state = UI_MENU; }
+    redraw();
 }
 
 // ---------- Tailscale ----------
@@ -1069,6 +1120,12 @@ static void busy_tick(void) {
             if (strcmp(shown_code, sess_pair_code()) != 0) { snprintf(shown_code, sizeof shown_code, "%s", sess_pair_code()); redraw(); }
             return;
         }
+    } else if (busy_kind == BUSY_SYNC) {
+        if (st == SESS_ACTIVE) state = UI_SYNC;
+        else if (st == SESS_ERROR && sess_auth_failed()) { auto_pair(); }
+        else if (st == SESS_ERROR) { msg_show(UI_MENU, "%s", sess_error()); sess_end(); }
+        else if (st == SESS_DONE) { msg_show(UI_MENU, "The computer closed the connection. Check the helper is running, then try again"); sess_end(); }
+        else return;
     } else if (busy_kind == BUSY_DROPLIST) {
         if (st == SESS_DONE) { sess_end(); drop_parse(); state = UI_DROP; }
         else if (st == SESS_ERROR && sess_auth_failed()) { auto_pair(); }
@@ -1122,6 +1179,12 @@ void ui_tick(void) {
     if (sel_clear_at && now > sel_clear_at && !cm_active) { sel_clear_at = 0; last_tap_text[0] = 0; sel_clear(); }
     status_led_fast_sampling(state == UI_BATT);
     if (state == UI_BATT) { static int64_t last_batt; if (now - last_batt > 500000) { last_batt = now; redraw(); } }
+    if (state == UI_SYNC) {   // the computer is working on the card, so no sleep, and the screen follows along
+        last_input_us = now;
+        if (sess_state() != SESS_ACTIVE) { msg_show(UI_MENU, "Sync ended. Open the GUI menu, Sync with the computer, to start it again"); sess_end(); return; }
+        static int64_t last_sync_draw;
+        if (now - last_sync_draw > 500000) { last_sync_draw = now; redraw(); }
+    }
     // Sleep after a while without keys or touch, but only on battery unless the box is unticked.
     if (!asleep && AUTOSLEEP_MIN[autosleep_idx] && now - last_input_us > AUTOSLEEP_MIN[autosleep_idx] * 60000000LL && !(nosleep_usb && on_usb_power())) {
         go_sleep();
@@ -1445,6 +1508,7 @@ static void redraw(void) {
         case UI_DROP: draw_drop(); break;
         case UI_THEMED: draw_themed(); break;
         case UI_TS: draw_ts(); break;
+        case UI_SYNC: draw_sync(); break;
         case UI_THEME_LOAD: draw_theme_load(); break;
         case UI_HIST: draw_hist(); break;
         case UI_WIFI: draw_wifi(); break;
@@ -1689,6 +1753,7 @@ static void key_menu(uint16_t code) {
             else if (menu_sel == M_THEMED) { themed_enter(); }
             else if (menu_sel == M_TS) { ts_sel = 0; state = UI_TS; }
             else if (menu_sel == M_DROP) { drop_enter(); return; }
+            else if (menu_sel == M_SYNC) { sync_enter(); return; }
             else if (menu_sel == M_BATT) { batt_sel = 0; state = UI_BATT; }
             else if (menu_sel == M_SEC) { sec_sel = 0; state = UI_SEC; }
             else if (menu_sel == M_STATUS) state = UI_STATUS;
@@ -2235,6 +2300,7 @@ bool ui_handle(a11_event_t *evp) {
         case UI_DROP: key_drop(code); break;
         case UI_THEMED: key_themed(code); break;
         case UI_TS: key_ts(code); break;
+        case UI_SYNC: key_sync(code); break;
         case UI_THEME_LOAD: key_theme_load(code); break;
         case UI_HIST: key_hist(code); break;
         case UI_SEC: key_sec(code); break;
