@@ -1,0 +1,115 @@
+diff --git i/src/keepalive.c w/src/keepalive.c
+index aa6d25c0..83bf0f7e 100644
+--- i/src/keepalive.c
++++ w/src/keepalive.c
+@@ -47,6 +47,11 @@ void libssh2_keepalive_config(LIBSSH2_SESSION *session,
+     else
+         session->keepalive_interval = ssh2_sec_to_timediff(interval_s);
+     session->keepalive_want_reply = want_reply ? 1 : 0;
++    /* Start the clock now. The session is calloc'd, so leaving this at 0 makes
++       the very first libssh2_keepalive_send() fire immediately instead of
++       after `interval` - which can push a GLOBAL_REQUEST out at a point in the
++       protocol where it is not yet legal. */
++    session->keepalive_last_sent = ssh2_now();
+ }
+ 
+ int libssh2_keepalive_send(LIBSSH2_SESSION *session, int *seconds_to_next)
+diff --git i/src/libssh2_priv.h w/src/libssh2_priv.h
+index 1500d1b6..a4c0773b 100644
+--- i/src/libssh2_priv.h
++++ w/src/libssh2_priv.h
+@@ -609,6 +609,12 @@ struct endpoint_data {
+     char *lang_prefs;
+ };
+ 
++/* Send buffer.  A terminal client never sends packets larger than a few KB
++ * (KEXINIT algorithm list is the largest, ~1.5 KB with default prefs).
++ * Shrinking this from MAX_SSH_PACKET_LEN (35 KB) saves ~30 KB from the
++ * session struct without affecting receive capacity. */
++#define LIBSSH2_OUTBUF_LEN 4096
++
+ #define PACKETBUFSIZE MAX_SSH_PACKET_LEN
+ 
+ struct transportpacket {
+@@ -637,7 +643,7 @@ struct transportpacket {
+                                are currently writing decrypted data */
+ 
+     /* ------------- for outgoing data --------------- */
+-    unsigned char outbuf[MAX_SSH_PACKET_LEN]; /* area for the outgoing data */
++    unsigned char outbuf[LIBSSH2_OUTBUF_LEN]; /* area for the outgoing data */
+ 
+     ssize_t ototal_num;     /* size of outbuf in number of bytes */
+     const unsigned char *odata; /* original pointer to the data */
+@@ -811,7 +817,7 @@ struct _LIBSSH2_SESSION {
+     /* State variables used in session_banner_receive(),
+        session_banner_send() */
+     ssh2_NB_states banner_TxRx_state;
+-    char banner_TxRx_banner[8192];
++    char banner_TxRx_banner[512]; /* SSH banners are rarely > 100 bytes */
+     ssize_t banner_TxRx_total_send;
+ 
+     /* State variables used in kexinit() */
+diff --git i/src/pem.c w/src/pem.c
+index 18c091b5..c67b1eb5 100644
+--- i/src/pem.c
++++ w/src/pem.c
+@@ -459,8 +459,11 @@ static int pem_parse_data_openssh(LIBSSH2_SESSION *session,
+ 
+     if((!passphrase || strlen(passphrase) == 0) &&
+        !SSH2_IS_LITERAL(ciphername, ciphername_len, "none")) {
+-        /* passphrase required */
+-        ret = LIBSSH2_ERROR_KEYFILE_AUTH_FAILED;
++        /* passphrase required - say so, otherwise the caller reports a
++           blank error and the user cannot tell this apart from a corrupt
++           key file. */
++        ret = ssh2_err(session, LIBSSH2_ERROR_KEYFILE_AUTH_FAILED,
++                       "encrypted key requires a passphrase");
+         goto out;
+     }
+ 
+diff --git i/src/transport.c w/src/transport.c
+index 95c73d05..4f5683bd 100644
+--- i/src/transport.c
++++ w/src/transport.c
+@@ -1082,7 +1082,7 @@ int ssh2_transport_send(LIBSSH2_SESSION *session,
+         /* the idea here is that these function must fail if the output gets
+            larger than what fits in the assigned buffer so thus they do not
+            check the input size as we do not know how much it compresses */
+-        size_t dest_len = MAX_SSH_PACKET_LEN - 5 - 256;
++        size_t dest_len = LIBSSH2_OUTBUF_LEN - 5 - 256;
+         size_t dest2_len = dest_len;
+ 
+         /* compress directly to the target buffer */
+@@ -1112,7 +1112,7 @@ int ssh2_transport_send(LIBSSH2_SESSION *session,
+         data_len = dest_len + dest2_len; /* use the combined length */
+     }
+     else {
+-        if((data_len + data2_len) >= (MAX_SSH_PACKET_LEN - 0x100))
++        if((data_len + data2_len) >= (LIBSSH2_OUTBUF_LEN - 0x100))
+             /* too large packet, return error for this until we make this
+                function split it up and send multiple SSH packets */
+             return LIBSSH2_ERROR_INVAL;
+diff --git i/src/userauth.c w/src/userauth.c
+index 17095668..10a78821 100644
+--- i/src/userauth.c
++++ w/src/userauth.c
+@@ -1526,11 +1526,17 @@ retry_auth:
+         if(rc == LIBSSH2_ERROR_EAGAIN)
+             return ssh2_err(session, LIBSSH2_ERROR_EAGAIN, "Would block");
+         else if(rc || session->userauth_pblc_data_len < 1) {
++            char errbuf[80];
+             SSH2_SAFEFREE(session, session->userauth_pblc_packet);
+             SSH2_SAFEFREE(session, session->userauth_pblc_method);
+             session->userauth_pblc_state = ssh2_NB_state_idle;
+-            return ssh2_err(session, LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED,
+-                            "Waiting for USERAUTH response");
++            /* Carry the transport rc: without it a dropped connection, a
++               protocol error and a zero-length reply are indistinguishable. */
++            snprintf(errbuf, sizeof(errbuf),
++                     "Waiting for USERAUTH response (rc=%d, len=%u)",
++                     rc, (unsigned)session->userauth_pblc_data_len);
++            return ssh2_err_flags(session, LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED,
++                                  errbuf, SSH2_ERR_FLAG_DUP);
+         }
+ 
+         if(session->userauth_pblc_data[0] == SSH_MSG_USERAUTH_SUCCESS) {

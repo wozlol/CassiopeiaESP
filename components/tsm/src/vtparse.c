@@ -1,0 +1,550 @@
+/*
+ * vtparse.c — VT byte-stream parser
+ *
+ * Paul Williams state machine + UTF-8 decoder.
+ * No heap allocations; no ESP-IDF dependency. Flash-resident (no IRAM_ATTR):
+ * all callers are tasks, and the hot loop's helpers live in flash anyway.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "vtparse.h"
+#include <string.h>
+
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#else
+#define IRAM_ATTR
+#define likely(x) x
+#define unlikely(x) x
+#endif
+
+/* Reset parameter state (called on entry to ESC, CSI, DCS). */
+static inline void do_clear(vtparse_t *p)
+{
+    p->intermediate = 0;
+    p->prefix       = 0;
+    p->nparams      = 0;
+    p->param_cur    = 0;
+    for (int i = 0; i < VTP_PARAMS_MAX; i++)
+        p->params[i] = -1;
+}
+
+/* Accumulate a parameter byte (digit, ':', ';').
+ * ':' and ';' both advance the slot so sub-params share the same array. */
+static inline void do_param(vtparse_t *p, uint8_t b)
+{
+    if (b == ';' || b == ':') {
+        if (p->param_cur < VTP_PARAMS_MAX - 1)
+            p->param_cur++;
+        /* Update nparams to include the new slot. */
+        if (p->param_cur + 1 > p->nparams)
+            p->nparams = p->param_cur + 1;
+        return;
+    }
+    /* Digit 0–9 */
+    if (p->param_cur >= VTP_PARAMS_MAX)
+        return;
+    if (p->params[p->param_cur] < 0)
+        p->params[p->param_cur] = b - '0';
+    else {
+        int32_t value = p->params[p->param_cur];
+        int32_t digit = b - '0';
+        p->params[p->param_cur] = value > (INT32_MAX - digit) / 10
+            ? INT32_MAX : value * 10 + digit;
+    }
+    if (p->param_cur + 1 > p->nparams)
+        p->nparams = p->param_cur + 1;
+}
+
+/* Store first intermediate byte; ignore subsequent ones (rare). */
+static inline void do_collect(vtparse_t *p, uint8_t b)
+{
+    if (likely(!p->intermediate))
+        p->intermediate = b;
+}
+
+/* Store first private-use parameter marker; ignore subsequent ones. */
+static inline void do_prefix(vtparse_t *p, uint8_t b)
+{
+    if (likely(!p->prefix))
+        p->prefix = b;
+}
+
+static inline void flush_print(vtparse_t *p)
+{
+    int n = p->print_len;
+    if (n == 0) return;
+    p->print_len = 0;
+    p->cb.print(p->print_buf, n, p->user);
+}
+
+static inline void append_print(vtparse_t *p, uint32_t cp)
+{
+    if (unlikely(p->print_len >= VTP_PRINT_BUF))
+        flush_print(p);
+    p->print_buf[p->print_len++] = cp;
+}
+
+static inline void emit_c0(vtparse_t *p, uint8_t b)
+{
+    p->cb.c0(b, p->user);
+}
+
+static inline void emit_esc(vtparse_t *p, uint8_t final)
+{
+    p->cb.esc(p->intermediate, final, p->user);
+}
+
+static inline void emit_csi(vtparse_t *p, uint8_t final)
+{
+    p->cb.csi(p->prefix, p->intermediate, final, p->params, p->nparams, p->user);
+}
+
+static inline void emit_osc(vtparse_t *p)
+{
+    p->osc_buf[p->osc_len] = 0; /* null-terminate */
+    p->cb.osc(p->osc_buf, p->osc_len, p->user);
+}
+
+static inline void emit_dcs(vtparse_t *p, uint8_t final)
+{
+    p->cb.dcs(p->prefix, p->intermediate, final, p->params, p->nparams, p->user);
+}
+
+static inline void enter_ground(vtparse_t *p)
+{
+    p->state       = VTP_ST_GROUND;
+    p->prev_string = VTP_STR_NONE;
+}
+
+/* Transition to ESC state from any state.
+ *
+ * Preserves prev_string when interrupting an OSC or DCS string so that
+ * a subsequent '\\' (ST) can complete the string correctly.
+ */
+static inline void enter_esc(vtparse_t *p)
+{
+    switch (p->state) {
+        case VTP_ST_OSC_STRING:
+            p->prev_string = VTP_STR_OSC;
+            break;
+        case VTP_ST_DCS_ENTRY:
+        case VTP_ST_DCS_PARAM:
+        case VTP_ST_DCS_INT:
+        case VTP_ST_DCS_PASS:
+        case VTP_ST_DCS_IGNORE:
+            p->prev_string = VTP_STR_DCS;
+            break;
+        case VTP_ST_SOS_PM_APC:
+            p->prev_string = VTP_STR_SOS;
+            break;
+        case VTP_ST_ESC:
+        case VTP_ST_ESC_INT:
+            /* Second ESC while already in ESC: keep existing prev_string. */
+            break;
+        default:
+            p->prev_string = VTP_STR_NONE;
+            break;
+    }
+    do_clear(p);
+    p->state = VTP_ST_ESC;
+}
+
+/* States in which the diagram executes C0 controls mid-sequence. String
+ * states ignore them (BEL ends an OSC; DCS passthrough has no data sink). */
+static inline bool executes_c0(const vtparse_t *p)
+{
+    switch (p->state) {
+        case VTP_ST_ESC:
+        case VTP_ST_ESC_INT:
+        case VTP_ST_CSI_ENTRY:
+        case VTP_ST_CSI_PARAM:
+        case VTP_ST_CSI_INT:
+        case VTP_ST_CSI_IGNORE:
+        case VTP_ST_DCS_ENTRY:
+        case VTP_ST_DCS_PARAM:
+        case VTP_ST_DCS_INT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* ESC final byte: ESC \ (ST) closes an interrupted string, anything else is
+ * a plain ESC sequence. Shared by the ESC and ESC-intermediate states. */
+static inline void esc_final(vtparse_t *p, uint8_t b)
+{
+    if (b == 0x5C && p->prev_string != VTP_STR_NONE) {
+        if (p->prev_string == VTP_STR_OSC)
+            emit_osc(p);
+        else if (p->prev_string == VTP_STR_DCS)
+            emit_dcs(p, b);
+        /* SOS/PM/APC content is fully ignored; consume ST silently. */
+    } else {
+        emit_esc(p, b);
+    }
+    enter_ground(p);
+}
+
+static inline void st_ground(vtparse_t *p, uint8_t b)
+{
+    if (b <= 0x1F) {
+        flush_print(p);
+        emit_c0(p, b);          /* C0 controls; ESC handled by "anywhere" */
+    } else if (likely(b <= 0x7E)) {
+        append_print(p, b);     /* printable ASCII */
+    }
+    /* 0x7F (DEL) → ignore */
+}
+
+static inline void st_esc(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x20 && b <= 0x2F) {
+        /* Intermediate byte (e.g. '(' for charset designation) */
+        do_collect(p, b);
+        p->state = VTP_ST_ESC_INT;
+    } else if (b == 0x5B) {         /* '[' → CSI */
+        do_clear(p);
+        p->prev_string = VTP_STR_NONE;
+        p->state = VTP_ST_CSI_ENTRY;
+    } else if (b == 0x5D) {         /* ']' → OSC */
+        p->osc_len     = 0;
+        p->prev_string = VTP_STR_NONE;
+        p->state       = VTP_ST_OSC_STRING;
+    } else if (b == 0x50) {         /* 'P' → DCS */
+        do_clear(p);
+        p->prev_string = VTP_STR_NONE;
+        p->state = VTP_ST_DCS_ENTRY;
+    } else if (b == 0x58 || b == 0x5E || b == 0x5F) { /* 'X' '^' '_' */
+        /* SOS / PM / APC — ignore until ST */
+        p->prev_string = VTP_STR_NONE;
+        p->state       = VTP_ST_SOS_PM_APC;
+    } else if (b >= 0x30 && b <= 0x7E) {
+        esc_final(p, b);
+    }
+    /* 0x7F → ignore */
+}
+
+static inline void st_esc_int(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x20 && b <= 0x2F) {
+        do_collect(p, b);       /* additional intermediate (unusual) */
+    } else if (b >= 0x30 && b <= 0x7E) {
+        esc_final(p, b);
+    }
+    /* 0x7F → ignore */
+}
+
+static inline  void st_csi_entry(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x20 && b <= 0x2F) {
+        do_collect(p, b);
+        p->state = VTP_ST_CSI_INT;
+    } else if (b >= 0x30 && b <= 0x39) {   /* digit */
+        do_param(p, b);
+        p->state = VTP_ST_CSI_PARAM;
+    } else if (b == 0x3A || b == 0x3B) {   /* ':' or ';' */
+        do_param(p, b);
+        p->state = VTP_ST_CSI_PARAM;
+    } else if (b >= 0x3C && b <= 0x3F) {   /* '<' '=' '>' '?' */
+        do_prefix(p, b);
+        p->state = VTP_ST_CSI_PARAM;
+    } else if (b >= 0x40 && b <= 0x7E) {   /* final byte */
+        emit_csi(p, b);
+        enter_ground(p);
+    }
+    /* 0x7F → ignore */
+}
+
+static inline void st_csi_param(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x20 && b <= 0x2F) {
+        do_collect(p, b);
+        p->state = VTP_ST_CSI_INT;
+    } else if ((b >= 0x30 && b <= 0x39) || b == 0x3A || b == 0x3B) {
+        do_param(p, b);
+    } else if (b >= 0x3C && b <= 0x3F) {
+        /* Second private marker after digits → malformed → ignore. */
+        p->state = VTP_ST_CSI_IGNORE;
+    } else if (b >= 0x40 && b <= 0x7E) {
+        emit_csi(p, b);
+        enter_ground(p);
+    }
+    /* 0x7F → ignore */
+}
+
+static inline void st_csi_int(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x20 && b <= 0x2F) {
+        /* Unsupported multi-intermediate functions must not alias one-byte forms. */
+        p->state = VTP_ST_CSI_IGNORE;
+    } else if (b >= 0x30 && b <= 0x3F) {
+        /* Parameter byte after intermediate → malformed → ignore. */
+        p->state = VTP_ST_CSI_IGNORE;
+    } else if (b >= 0x40 && b <= 0x7E) {
+        emit_csi(p, b);
+        enter_ground(p);
+    }
+    /* 0x7F → ignore */
+}
+
+static inline void st_csi_ignore(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x40 && b <= 0x7E)
+        enter_ground(p);    /* discard sequence, return to ground */
+    /* everything else: stay and discard */
+}
+
+static inline void st_dcs_entry(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x20 && b <= 0x2F) {
+        do_collect(p, b);
+        p->state = VTP_ST_DCS_INT;
+    } else if ((b >= 0x30 && b <= 0x39) || b == 0x3B) {
+        do_param(p, b);
+        p->state = VTP_ST_DCS_PARAM;
+    } else if (b == 0x3A || (b >= 0x3C && b <= 0x3F)) {
+        p->state = VTP_ST_DCS_IGNORE;
+    } else if (b >= 0x40 && b <= 0x7E) {
+        /* DCS hook: emit stub event then collect passthrough data. */
+        emit_dcs(p, b);
+        p->state = VTP_ST_DCS_PASS;
+    }
+}
+
+static inline void st_dcs_param(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x20 && b <= 0x2F) {
+        do_collect(p, b);
+        p->state = VTP_ST_DCS_INT;
+    } else if ((b >= 0x30 && b <= 0x39) || b == 0x3B) {
+        do_param(p, b);
+    } else if (b == 0x3A || (b >= 0x3C && b <= 0x3F)) {
+        p->state = VTP_ST_DCS_IGNORE;
+    } else if (b >= 0x40 && b <= 0x7E) {
+        emit_dcs(p, b);
+        p->state = VTP_ST_DCS_PASS;
+    }
+}
+
+static inline void st_dcs_int(vtparse_t *p, uint8_t b)
+{
+    if (b >= 0x20 && b <= 0x2F) {
+        do_collect(p, b);
+    } else if (b >= 0x30 && b <= 0x3F) {
+        p->state = VTP_ST_DCS_IGNORE;
+    } else if (b >= 0x40 && b <= 0x7E) {
+        emit_dcs(p, b);
+        p->state = VTP_ST_DCS_PASS;
+    }
+}
+
+/* DCS passthrough data (Phase 1 stub: data bytes are silently consumed). */
+static inline  void st_dcs_pass(vtparse_t *p, uint8_t b)
+{
+    (void)p;
+    (void)b;
+    /* Terminated by 0x9C or ESC \ via the "anywhere" transitions. */
+}
+
+static inline void st_dcs_ignore(vtparse_t *p, uint8_t b)
+{
+    (void)p;
+    (void)b;
+    /* Ignore everything until ST. */
+}
+
+static inline void st_osc(vtparse_t *p, uint8_t b)
+{
+    if (b == 0x07) {
+        /* BEL — xterm extension for OSC termination. */
+        emit_osc(p);
+        enter_ground(p);
+    } else if (b >= 0x20 && b <= 0x7E) {
+        /* Collect printable ASCII bytes (7-bit only). Phase 1 ignores UTF-8
+         * in titles; high bytes don't reach this function. */
+        if (p->osc_len < VTP_OSC_MAX)
+            p->osc_buf[p->osc_len++] = b;
+        /* Bytes beyond VTP_OSC_MAX are silently dropped. */
+    }
+    /* Other C0 (except BEL already handled above) → ignore. */
+}
+
+static inline void st_sos_pm_apc(vtparse_t *p, uint8_t b)
+{
+    (void)p;
+    (void)b;
+    /* Ignore everything until ST (ESC \ or 0x9C). */
+}
+
+/* ── UTF-8 lead byte handler ──────────────────────────────────────────────── */
+
+/* Begin accumulating a multi-byte UTF-8 sequence from lead byte b.
+ * Returns true on a valid lead; false if b should produce U+FFFD. */
+static inline bool utf8_start(vtparse_t *p, uint8_t b)
+{
+    if (unlikely(b >= 0xF5)) {
+        return false;       /* would exceed U+10FFFF */
+    }
+    if (b >= 0xF0) {
+        p->utf8_cp     = b & 0x07u;
+        p->utf8_remain = 3;
+        p->utf8_min    = 0x10000u;
+    } else if (b >= 0xE0) {
+        p->utf8_cp     = b & 0x0Fu;
+        p->utf8_remain = 2;
+        p->utf8_min    = 0x800u;
+    } else if (b >= 0xC2) {
+        p->utf8_cp     = b & 0x1Fu;
+        p->utf8_remain = 1;
+        p->utf8_min    = 0x80u;
+    } else {
+        return false;       /* 0xC0, 0xC1: overlong encoding */
+    }
+    return true;
+}
+
+void vtparse_init(vtparse_t *p, const vt_callbacks_t *cb, void *user)
+{
+    memset(p, 0, sizeof(*p));
+    p->cb    = *cb;
+    p->user  = user;
+    p->state = VTP_ST_GROUND;
+    for (int i = 0; i < VTP_PARAMS_MAX; i++)
+        p->params[i] = -1;
+}
+
+void vtparse_feed(vtparse_t *p, const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = data[i];
+
+        if (p->utf8_remain > 0) {
+            if ((b & 0xC0u) == 0x80u) {
+                /* Valid continuation byte. */
+                p->utf8_cp = (p->utf8_cp << 6) | (b & 0x3Fu);
+                if (--p->utf8_remain == 0) {
+                    uint32_t cp = p->utf8_cp;
+                    /* Reject overlong forms, surrogates and out-of-BMP
+                     * (unsupported font). */
+                    if (unlikely(cp < p->utf8_min ||
+                        (cp >= 0xD800u && cp <= 0xDFFFu) ||
+                        cp > 0xFFFFu)) {
+                        cp = 0xFFFDu;
+                    }
+                    if (likely(p->state == VTP_ST_GROUND))
+                        append_print(p, cp);
+                }
+                continue;
+            }
+            /* Not a continuation byte: cancel the sequence → U+FFFD. */
+            if (p->state == VTP_ST_GROUND)
+                append_print(p, 0xFFFDu);
+            p->utf8_remain = 0;
+            p->utf8_cp     = 0;
+            /* Fall through to process the current byte normally. */
+        }
+
+        /* GROUND fast path
+         * No UTF-8 pending (guaranteed above) and in GROUND. Bulk-append a
+         * run of printable ASCII, skipping the per-byte switch and the
+         * out-of-line append_print call. DEL/C0/C1/UTF-8 leads break the run.
+         * Then fall to the normal per-byte path below on the next pass. */
+        if (p->state == VTP_ST_GROUND && b >= 0x20 && b <= 0x7E) {
+            size_t j = i;
+            for (;;) {
+                if (unlikely(p->print_len >= VTP_PRINT_BUF))
+                    flush_print(p);
+                p->print_buf[p->print_len++] = b;
+                if (++j >= len)
+                    break;
+                b = data[j];
+                if (b < 0x20 || b > 0x7E)
+                    break;
+            }
+            i = j - 1;
+            continue;
+        }
+
+        /* ── CSI parameter fast path ──────────────────────────────────────
+         * Digits, ':' and ';' are the contiguous range 0x30..0x3B. They make
+         * up ~90% of SGR-dense streams (truecolor btop). Accumulate the run
+         * with do_param inlined, skipping the anywhere-checks and the state
+         * switch per byte. Any other byte falls back to st_csi_param on the
+         * next pass, which treats 0x30..0x3B identically. */
+        if (p->state == VTP_ST_CSI_PARAM && b >= 0x30 && b <= 0x3B) {
+            size_t j = i;
+            do {
+                do_param(p, b);
+                if (++j >= len) break;
+                b = data[j];
+            } while (b >= 0x30 && b <= 0x3B);
+            i = j - 1;
+            continue;
+        }
+
+        /* ── "Anywhere" transitions (ASCII control only, UTF-8 mode) ────── */
+        if (b == 0x18 || b == 0x1A) {
+            flush_print(p);
+            emit_c0(p, b);
+            enter_ground(p);
+            continue;
+        }
+        if (b == 0x1B) {
+            flush_print(p);
+            enter_esc(p);
+            continue;
+        }
+
+        if (b >= 0x80u) {
+            /* Pending UTF-8 consumed continuation bytes above; only bare ST remains. */
+            if (b == 0x9Cu) {
+                flush_print(p);
+                if (p->state == VTP_ST_OSC_STRING)
+                    emit_osc(p);
+                else if (p->state == VTP_ST_DCS_PASS ||
+                         p->state == VTP_ST_DCS_IGNORE)
+                    emit_dcs(p, 0x5Cu); /* report as ESC \ equivalent */
+                enter_ground(p);
+                continue;
+            }
+            /* Decode UTF-8 in every state so no continuation byte can reach
+             * the ST test above; the codepoint prints only in GROUND. */
+            if (b >= 0xC2u && b <= 0xF4u && utf8_start(p, b))
+                continue;
+            /* Invalid lead or out-of-range: U+FFFD in GROUND, dropped elsewhere. */
+            if (p->state == VTP_ST_GROUND)
+                append_print(p, 0xFFFDu);
+            continue;
+        }
+
+        /* C0 inside ESC/CSI/DCS parameters executes and the sequence goes on. */
+        if (b <= 0x1F && executes_c0(p)) {
+            emit_c0(p, b);
+            continue;
+        }
+
+        /* ── Normal state dispatch (b is 0x00–0x7F) ─────────────────────── */
+        switch (p->state) {
+            case VTP_ST_GROUND:       st_ground(p, b);      break;
+            case VTP_ST_ESC:          st_esc(p, b);         break;
+            case VTP_ST_ESC_INT:      st_esc_int(p, b);     break;
+            case VTP_ST_CSI_ENTRY:    st_csi_entry(p, b);   break;
+            case VTP_ST_CSI_PARAM:    st_csi_param(p, b);   break;
+            case VTP_ST_CSI_INT:      st_csi_int(p, b);     break;
+            case VTP_ST_CSI_IGNORE:   st_csi_ignore(p, b);  break;
+            case VTP_ST_DCS_ENTRY:    st_dcs_entry(p, b);   break;
+            case VTP_ST_DCS_PARAM:    st_dcs_param(p, b);   break;
+            case VTP_ST_DCS_INT:      st_dcs_int(p, b);     break;
+            case VTP_ST_DCS_PASS:     st_dcs_pass(p, b);    break;
+            case VTP_ST_DCS_IGNORE:   st_dcs_ignore(p, b);  break;
+            case VTP_ST_OSC_STRING:   st_osc(p, b);         break;
+            case VTP_ST_SOS_PM_APC:   st_sos_pm_apc(p, b);  break;
+            default:                  break;
+        }
+    }
+    flush_print(p);
+}

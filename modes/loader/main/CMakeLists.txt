@@ -1,0 +1,1 @@
+idf_component_register(SRCS "loader.c" INCLUDE_DIRS "." PRIV_REQUIRES status_led prefs app_update esp_system spi_flash fatfs sdmmc esp_driver_sdmmc esp_driver_usb_serial_jtag vfs display a11_keys nrf_swd esp_driver_gpio)

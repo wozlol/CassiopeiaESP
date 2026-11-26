@@ -1,0 +1,7 @@
+menu "A-11 font"
+    config A11_FONT_SMALL_ONLY
+        bool "Only the two smallest font sizes"
+        default n
+        help
+            Leaves out the larger font tables, for the small loader image.
+endmenu

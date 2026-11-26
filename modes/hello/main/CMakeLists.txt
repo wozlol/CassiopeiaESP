@@ -1,0 +1,5 @@
+if(NOT DEFINED HELLO_NAME)
+    set(HELLO_NAME "hello")
+endif()
+idf_component_register(SRCS "hello.c" INCLUDE_DIRS "." PRIV_REQUIRES app_update esp_system spi_flash)
+target_compile_definitions(${COMPONENT_LIB} PRIVATE HELLO_NAME="${HELLO_NAME}")

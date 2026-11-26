@@ -1,0 +1,22 @@
+# build output and downloaded libraries, rebuilt by idf.py
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+**/build_a/
+**/build_b/
+# helper programs are built from helper/*.go and published on the project web page
+helper/dist/
+helper/a11helper
+# local files
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+backup/
+MORNING.md
+modes/sd/modes/
+.cache/
+*.elf
+modes/sd/library/Notes/PLAN.md
+modes/sd/library/Notes/WIRING.md

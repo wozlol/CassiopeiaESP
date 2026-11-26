@@ -1,0 +1,1 @@
+idf_component_register(SRCS "media.c" INCLUDE_DIRS "." REQUIRES minimp3 PRIV_REQUIRES launcher_guard display a11_keys touch prefs sdcard board a11_font i2c_bus esp_timer esp_system app_update esp_partition esp_driver_gpio esp_driver_i2s)

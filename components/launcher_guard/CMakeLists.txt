@@ -1,0 +1,1 @@
+idf_component_register(SRCS "launcher_guard.c" INCLUDE_DIRS "include" REQUIRES prefs PRIV_REQUIRES display status_led a11_keys esp_psram app_update esp_partition esp_system esp_timer esp_hw_support freertos)

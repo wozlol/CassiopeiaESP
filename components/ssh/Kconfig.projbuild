@@ -1,0 +1,13 @@
+menu "SSH client"
+    config SSH_KEEPALIVE_INTERVAL
+        int "SSH keep-alive interval (seconds), 0 turns it off"
+        default 30
+        range 0 300
+    config SSH_RECV_WINDOW
+        int "SSH receive window size (bytes)"
+        default 262144
+        range 4096 262144
+    config SSH_WIFI_PS_NONE
+        bool "Turn Wi-Fi power save off while an SSH session is open"
+        default y
+endmenu

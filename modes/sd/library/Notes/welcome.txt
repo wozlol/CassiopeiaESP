@@ -1,0 +1,9 @@
+Reference reader sample text.
+
+This file is plain text. Scroll with Up and Down, PageUp and PageDown, or by dragging
+a finger. Alt+Left goes to the top and Alt+Right to the end, like the terminal.
+Ctrl minus and Ctrl equals change the text size. t changes the theme. / searches
+inside the page and n finds the next match.
+
+Packs made with tools/a11pack.py appear as [pack] entries. Open one and type the
+first letters of a title.
