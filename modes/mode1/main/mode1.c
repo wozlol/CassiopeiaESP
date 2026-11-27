@@ -12,6 +12,17 @@
 #include "vtkeys.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
+#include "app_files.h"
+
+static QueueHandle_t key_q, touch_q;
+
+static int run_app(int which) {   // only the file manager runs inside this program, the reader and media are in the Library program
+    (void)which;
+    esp_task_wdt_delete(NULL);
+    app_exit_t r = files_app(key_q, touch_q);
+    esp_task_wdt_add(NULL);
+    return r == APP_SLEEP ? 2 : 1;
+}
 
 static void session_send(const char *data, size_t len) {
     if (sess_send(data, len)) return;
@@ -35,15 +46,15 @@ static void terminal_start(int cols, int rows) {
 void app_main(void) {
     launcher_guard_start();
     display_init();
-    ui_callbacks_t cbs = {.send = session_send, .terminal_reset = terminal_start};
+    ui_callbacks_t cbs = {.send = session_send, .terminal_reset = terminal_start, .run_app = run_app};
     int cols, rows;
     ui_init(&cbs, &cols, &rows);
     terminal_start(cols, rows);
-    QueueHandle_t q = xQueueCreate(32, sizeof(a11_event_t));
+    QueueHandle_t q = key_q = xQueueCreate(32, sizeof(a11_event_t));
     a11_keys_start(q);   // before ui_ready, it reads which keys woke the device from Off
     ui_ready();
     status_led_start();
-    QueueHandle_t tq = xQueueCreate(32, sizeof(touch_event_t));
+    QueueHandle_t tq = touch_q = xQueueCreate(32, sizeof(touch_event_t));
     touch_start(tq);
     int64_t last_tick = 0;
     esp_task_wdt_add(NULL);   // if this loop ever stops for 6 seconds the device prints where it was and restarts

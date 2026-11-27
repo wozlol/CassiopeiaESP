@@ -11,6 +11,8 @@ typedef struct {
     void (*send)(const char *data, size_t len);
     // The font changed. The app must rebuild the terminal for the new grid and register its buffer with the display.
     void (*terminal_reset)(int cols, int rows);
+    // Runs a full screen app (0 reader, 1 media, 2 files) until the person leaves it. Returns 1 for back, 2 when they pressed Off.
+    int (*run_app)(int which);
 } ui_callbacks_t;
 
 // Call after display_init(). Mounts storage, loads settings and clipboard, applies theme, font and brightness.

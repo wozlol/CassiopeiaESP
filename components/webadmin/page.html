@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Casio</title>
+<style>
+:root{--bg:#0b0d0b;--fg:#d6e8d0;--dim:#8a9a86;--acc:#9dff6a;--card:#141814;--line:#263026;--bad:#ff7a7a}
+@media (prefers-color-scheme: light){:root{--bg:#f4f6f1;--fg:#1d261b;--dim:#5b6858;--acc:#2f7d12;--card:#fff;--line:#d3dbd0;--bad:#b32121}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
+main{max-width:56rem;margin:0 auto;padding:1rem}
+h1{font-size:1.3rem;margin:.2rem 0 .8rem}a{color:var(--acc)}
+.bar{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center;margin:.6rem 0}
+button,select,input,textarea{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:.35rem .7rem}
+button{cursor:pointer}button:hover{border-color:var(--acc)}button.go{background:var(--acc);color:#0b0d0b;border-color:var(--acc)}
+.tabs button{border-radius:6px 6px 0 0}.tabs button.on{border-color:var(--acc);color:var(--acc)}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:6px}
+td,th{padding:.35rem .6rem;border-bottom:1px solid var(--line);text-align:left}th{color:var(--dim);font-weight:500}
+td.n{word-break:break-all}td.s,td.a{white-space:nowrap}td.s{color:var(--dim);text-align:right}
+.drop{border:2px dashed var(--line);border-radius:8px;padding:1rem;text-align:center;color:var(--dim);margin:.6rem 0}.drop.over{border-color:var(--acc);color:var(--acc)}
+.msg{min-height:1.4rem;color:var(--dim)}.bad{color:var(--bad)}
+.clip{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:.5rem;margin:.5rem 0}.clip textarea{width:100%;min-height:3.2rem}
+.prog{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin:.3rem 0}.prog i{display:block;height:100%;background:var(--acc);width:0}
+#login{max-width:20rem;margin:20vh auto}#login input{width:100%;margin:.6rem 0;font-size:1.3rem;letter-spacing:.3em;text-align:center}
+</style></head><body><main>
+<div id="login" hidden><h1>Casio</h1><div>Type the code shown on the Casio, GUI menu, Web admin.</div><input id="code" inputmode="numeric" autocomplete="off" maxlength="6"><button class="go" id="loginbtn" style="width:100%">Open</button><div class="msg bad" id="lmsg"></div></div>
+<div id="app" hidden>
+<h1>Casio <span id="info" style="font-size:.85rem;color:var(--dim);font-weight:400"></span></h1>
+<div class="tabs"><button id="t1" class="on">SD card files</button> <button id="t2">Clipboard</button></div>
+<section id="files">
+ <div class="bar"><b id="crumbs"></b><span style="flex:1"></span><button id="up">Up</button><button id="mk">New folder</button><button id="rf">Refresh</button></div>
+ <div class="drop" id="drop">Drop files here to put them in this folder, or <label><a href="#" id="pick">choose files</a><input id="file" type="file" multiple hidden></label></div>
+ <div id="prog"></div><div class="msg" id="msg"></div>
+ <table><thead><tr><th>Name</th><th style="text-align:right">Size</th><th></th></tr></thead><tbody id="rows"></tbody></table>
+</section>
+<section id="clips" hidden>
+ <div class="bar"><button class="go" id="addclip">Add a clip</button><button id="rfc">Refresh</button></div>
+ <div class="msg" id="cmsg"></div><div id="cl"></div>
+</section>
+</div></main>
+<script>
+const H={'X-A11':'1'};let dir='';
+const $=id=>document.getElementById(id);
+async function api(path,opt={}){opt.headers=Object.assign({},H,opt.headers||{});const r=await fetch(path,opt);if(r.status===401){showLogin();throw new Error('login')}if(!r.ok){const t=await r.text();throw new Error(t||r.status)}return r}
+function showLogin(){$('app').hidden=true;$('login').hidden=false;$('code').focus()}
+function fmt(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(2)+' GB'}
+function say(el,t,bad){el.textContent=t;el.className='msg'+(bad?' bad':'')}
+async function login(){try{const r=await fetch('/api/login',{method:'POST',headers:H,body:$('code').value});if(!r.ok){say($('lmsg'),await r.text(),true);return}$('login').hidden=true;start()}catch(e){say($('lmsg'),String(e),true)}}
+async function info(){const j=await (await api('/api/info')).json();$('info').textContent=j.free!==undefined?`${fmt(j.free)} free of ${fmt(j.total)}  ·  running ${j.running}`:''}
+function crumbs(){const parts=dir?dir.split('/'):[];let h='<a href="#" data-d="">card</a>',p='';for(const x of parts){p+=(p?'/':'')+x;h+=' / <a href="#" data-d="'+p+'">'+x+'</a>'}$('crumbs').innerHTML=h;$('crumbs').querySelectorAll('a').forEach(a=>a.onclick=e=>{e.preventDefault();go(a.dataset.d)})}
+async function go(d){dir=d;crumbs();say($('msg'),'');const rows=$('rows');rows.innerHTML='';
+ try{const j=await (await api('/api/ls?dir='+encodeURIComponent(dir))).json();
+ j.items.sort((a,b)=>(b.d?1:0)-(a.d?1:0)||a.n.localeCompare(b.n));
+ for(const it of j.items){const tr=document.createElement('tr');const full=(dir?dir+'/':'')+it.n;
+  const n=document.createElement('td');n.className='n';
+  if(it.d){const a=document.createElement('a');a.href='#';a.textContent=it.n+'/';a.onclick=e=>{e.preventDefault();go(full)};n.appendChild(a)}
+  else{const a=document.createElement('a');a.href='/api/file?path='+encodeURIComponent(full);a.textContent=it.n;n.appendChild(a)}
+  const s=document.createElement('td');s.className='s';s.textContent=it.d?'':fmt(it.s);
+  const ac=document.createElement('td');ac.className='a';
+  if(!it.d&&dir==='modes'&&/\.bin$/i.test(it.n)){const sel=document.createElement('select');for(let i=1;i<=4;i++){const o=document.createElement('option');o.value=i;o.textContent='slot '+i;sel.appendChild(o)}const b=document.createElement('button');b.textContent='Install';b.onclick=()=>install(full,sel.value);ac.appendChild(sel);ac.appendChild(b);ac.append(' ')}
+  const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>remove(full,it.d);ac.appendChild(del);
+  tr.append(n,s,ac);rows.appendChild(tr)}
+ if(!j.items.length)rows.innerHTML='<tr><td colspan="3" style="color:var(--dim)">Empty</td></tr>';
+ }catch(e){if(e.message!=='login')say($('msg'),String(e.message),true)}}
+async function remove(p,isdir){if(!confirm('Delete '+p+(isdir?' and everything in it':'')+'? This cannot be undone.'))return;try{await api('/api/'+(isdir?'dir':'file')+'?path='+encodeURIComponent(p),{method:'DELETE'});go(dir);info()}catch(e){say($('msg'),String(e.message),true)}}
+async function install(p,slot){say($('msg'),'Installing '+p+' in slot '+slot+', this takes up to a minute');try{const t=await (await api('/api/install?path='+encodeURIComponent(p)+'&slot='+slot,{method:'POST'})).text();say($('msg'),t)}catch(e){say($('msg'),String(e.message),true)}}
+function upload(files){if(!dir){say($('msg'),'Open modes, library or media first, files go into a folder.',true);return}
+ let i=0;const next=()=>{if(i>=files.length){go(dir);info();return}const f=files[i++];const path=(dir+'/'+f.name);
+  const x=new XMLHttpRequest();x.open('PUT','/api/file?path='+encodeURIComponent(path));x.setRequestHeader('X-A11','1');
+  const bar=document.createElement('div');bar.className='prog';bar.innerHTML='<i></i>';$('prog').innerHTML='';$('prog').appendChild(bar);
+  x.upload.onprogress=e=>{bar.firstChild.style.width=(e.loaded*100/e.total)+'%';say($('msg'),'Sending '+f.name+'  '+fmt(e.loaded)+' of '+fmt(e.total))};
+  x.onload=()=>{if(x.status===401){showLogin();return}if(x.status>=300){say($('msg'),f.name+': '+x.responseText,true);return}next()};
+  x.onerror=()=>say($('msg'),'The connection dropped while sending '+f.name,true);x.send(f)};next()}
+async function mkdir(){if(!dir){say($('msg'),'Open modes, library or media first.',true);return}const n=prompt('Name of the new folder');if(!n)return;try{await api('/api/mkdir?path='+encodeURIComponent(dir+'/'+n),{method:'POST'});go(dir)}catch(e){say($('msg'),String(e.message),true)}}
+async function clips(){const j=await (await api('/api/clips')).json();const box=$('cl');box.innerHTML='';
+ j.clips.forEach((t,i)=>{const d=document.createElement('div');d.className='clip';const ta=document.createElement('textarea');ta.value=t;
+  const save=document.createElement('button');save.textContent='Save';save.onclick=async()=>{try{await api('/api/clips/'+(i+1),{method:'PUT',body:ta.value});say($('cmsg'),'Saved clip '+(i+1))}catch(e){say($('cmsg'),String(e.message),true)}};
+  const del=document.createElement('button');del.textContent='Delete';del.onclick=async()=>{if(confirm('Delete clip '+(i+1)+'?')){await api('/api/clips/'+(i+1),{method:'DELETE'});clips()}};
+  const cp=document.createElement('button');cp.textContent='Copy here';cp.onclick=()=>navigator.clipboard&&navigator.clipboard.writeText(ta.value);
+  const bar=document.createElement('div');bar.className='bar';bar.append(document.createTextNode('Clip '+(i+1)),save,cp,del);d.append(bar,ta);box.appendChild(d)});
+ if(!j.clips.length)box.innerHTML='<div class="msg">The clipboard is empty.</div>'}
+async function addclip(){const t=prompt('Text for the new clip');if(!t)return;try{await api('/api/clips',{method:'POST',body:t});clips()}catch(e){say($('cmsg'),String(e.message),true)}}
+function tab(n){$('files').hidden=n!==1;$('clips').hidden=n!==2;$('t1').className=n===1?'on':'';$('t2').className=n===2?'on':'';if(n===2)clips()}
+async function start(){try{await info();$('app').hidden=false;$('login').hidden=true;go('')}catch(e){}}
+$('loginbtn').onclick=login;$('code').onkeydown=e=>{if(e.key==='Enter')login()};
+$('t1').onclick=()=>tab(1);$('t2').onclick=()=>tab(2);$('rf').onclick=()=>go(dir);$('rfc').onclick=clips;$('addclip').onclick=addclip;$('mk').onclick=mkdir;
+$('up').onclick=()=>go(dir.includes('/')?dir.slice(0,dir.lastIndexOf('/')):'');
+$('pick').onclick=e=>{e.preventDefault();$('file').click()};$('file').onchange=e=>upload([...e.target.files]);
+const dz=$('drop');dz.ondragover=e=>{e.preventDefault();dz.classList.add('over')};dz.ondragleave=()=>dz.classList.remove('over');dz.ondrop=e=>{e.preventDefault();dz.classList.remove('over');upload([...e.dataTransfer.files])};
+start();
+</script></body></html>

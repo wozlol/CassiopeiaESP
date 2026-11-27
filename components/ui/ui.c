@@ -3,13 +3,15 @@
 // into its own cell buffer and the terminal keeps running underneath, closing hands the display back.
 #include "ui.h"
 #include <stdarg.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "a11_font.h"
 #include "clipboard.h"
 #include "tunnel.h"
-#include "syncd.h"
+#include "webadmin.h"
+#include "app_switch.h"
 #include "display.h"
 #include "esp_heap_caps.h"
 #include "esp_littlefs.h"
@@ -46,8 +48,8 @@
 #define HID_DOWN 81
 #define HID_UP 82
 
-typedef enum { UI_OFF, UI_MENU, UI_CLIP, UI_CLIP_NEW, UI_GRAB, UI_STATUS, UI_WIFI, UI_INPUT, UI_PC, UI_FIND, UI_SESS, UI_BUSY, UI_MSG, UI_CONFIRM, UI_SEC, UI_SEC_CAPTURE, UI_LOCK, UI_CLIP_EDIT, UI_BATT, UI_HIST, UI_DROP, UI_THEMED, UI_THEME_LOAD, UI_TS, UI_SYNC } ui_state_t;
-enum { M_SESS, M_CLIP, M_WIFI, M_PC, M_THEME, M_THEMED, M_TS, M_FONT, M_BRIGHT, M_BG, M_CAPSKEY, M_DROP, M_SYNC, M_BATT, M_SEC, M_STATUS, M_LOADER, M_COUNT };
+typedef enum { UI_OFF, UI_MENU, UI_CLIP, UI_CLIP_NEW, UI_GRAB, UI_STATUS, UI_WIFI, UI_INPUT, UI_PC, UI_FIND, UI_SESS, UI_BUSY, UI_MSG, UI_CONFIRM, UI_SEC, UI_SEC_CAPTURE, UI_LOCK, UI_CLIP_EDIT, UI_BATT, UI_HIST, UI_DROP, UI_THEMED, UI_THEME_LOAD, UI_TS, UI_SYNC, UI_WEB } ui_state_t;
+enum { M_SESS, M_CLIP, M_LIBRARY, M_FILES, M_WIFI, M_PC, M_THEME, M_THEMED, M_TS, M_FONT, M_BRIGHT, M_BG, M_CAPSKEY, M_WEB, M_BATT, M_SEC, M_STATUS, M_LOADER, M_COUNT };
 typedef enum { IN_WIFI_PASS, IN_PC_HOST, IN_SESS_NAME, IN_PIN_NEW, IN_PIN_CONFIRM, IN_PC_AWAY, IN_THEME_NAME, IN_TS_KEY } input_kind_t;
 typedef enum { BUSY_WIFI, BUSY_FIND, BUSY_LIST, BUSY_PAIR, BUSY_ATTACH, BUSY_KILL, BUSY_HIST, BUSY_DROPLIST, BUSY_DROPGET, BUSY_SYNC } busy_t;
 
@@ -58,6 +60,8 @@ static const int BRIGHT[] = {10, 25, 40, 60, 80, 100};
 static ui_callbacks_t cb;
 static ui_state_t state = UI_OFF;
 static bool shift, ctrl, caps, gui, gui_tap;
+static bool hold_guard;   // after the secret press, the keys still held down are not a shortcut until they have been let go
+static int64_t hold_guard_t;
 static int theme_idx, font_idx, bright_idx;
 static terminal_cell_t *ov;
 static int ocols, orows, term_cols, term_rows;
@@ -235,9 +239,9 @@ static void draw_batt(void);
 static void draw_drop(void);
 static void draw_themed(void);
 static void draw_ts(void);
-static void draw_sync(void);
-static void key_sync(uint16_t code);
-static void sync_enter(void);
+static void draw_web(void);
+static void key_web(uint16_t code);
+static int web_sel;
 static void key_ts(uint16_t code);
 static int ts_sel;
 static void key_themed(uint16_t code);
@@ -289,6 +293,8 @@ static void close_ui(void) {
     vterm_cursor_refresh();
 }
 
+static void launch_app(int which);
+static void go_sleep(void);
 static void to_loader(void) {
     esp_ota_set_boot_partition(esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL));
     esp_restart();
@@ -322,11 +328,14 @@ static void draw_menu(void) {
     static char ts_line[80];
     snprintf(ts_line, sizeof ts_line, "Tailscale   %s", tunnel_state_text());
     items[M_TS] = ts_line;
-    items[M_DROP] = "Get files from the computer";
-    items[M_SYNC] = "Sync with the computer";
+    static char web_line[80];
+    snprintf(web_line, sizeof web_line, "Web admin    %s", webadmin_state_text());
+    items[M_WEB] = web_line;
     items[M_BATT] = "Battery and power";
     items[M_SEC] = "Security";
     items[M_STATUS] = "Status";
+    items[M_LIBRARY] = "Library, reader and media (restarts)";
+    items[M_FILES] = "Files";
     items[M_LOADER] = "Back to the loader";
     menu_items_now = items;
     draw_list(r0, end, M_COUNT, menu_sel, menu_item);
@@ -385,6 +394,7 @@ static void draw_status(void) {
     int64_t up = esp_timer_get_time() / 1000000;
     snprintf(b, sizeof b, " Uptime        %lld s", (long long)up); r = ov_text(r, 0, b, end);
     snprintf(b, sizeof b, " Internal RAM  %u KB free", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); r = ov_text(r, 0, b, end);
+    snprintf(b, sizeof b, " Lowest RAM    %u KB free at the worst moment since start", (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024)); r = ov_text(r, 0, b, end);
     snprintf(b, sizeof b, " Extra RAM     %u KB free", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)); r = ov_text(r, 0, b, end);
     snprintf(b, sizeof b, " Clipboard     %d entries", clipboard_count()); r = ov_text(r, 0, b, end);
     snprintf(b, sizeof b, " Grid          %dx%d", term_cols, term_rows); r = ov_text(r, 0, b, end);
@@ -665,49 +675,44 @@ static void reattach(void) {
     sess_begin(SESS_ATTACH, last_session);
 }
 
-// ---------- Sync mode ----------
-// While this screen is open the handheld stays connected to the computer in use, and the computer can send files, take files, delete files,
-// manage the clipboard and install firmware into a slot. Nothing listens here, the handheld made the connection. Esc ends it.
-static void sync_enter(void) {
-    if (net_state() != NET_CONNECTED) { msg_show(UI_MENU, "Wi-Fi is not connected. Open the GUI menu, Wi-Fi, and join a network"); return; }
-    if (!pc.fp[0]) { msg_show(UI_MENU, "Not paired with a computer yet. Open the GUI menu, Computer, and press A to pair"); return; }
-    if (!sdcard_mount()) { msg_show(UI_MENU, "No SD card, or it is not FAT32. Put in a FAT32 card and try again"); return; }
-    sess_end();
-    sess_set_target(pc.host, pc.port, pc.fp);
-    sess_begin(SESS_SYNC, NULL);
-    if (sess_state() == SESS_ERROR) { msg_show(UI_MENU, "%s", sess_error()); return; }
-    busy_kind = BUSY_SYNC;
-    snprintf(busy_msg, sizeof busy_msg, "Connecting to %.30s for sync ...", pc.name);
-    state = UI_BUSY;
+// ---------- Web admin ----------
+// A page on the handheld for the SD card files and the clipboard. It listens on the Tailscale address, and only also on the home Wi-Fi if allowed.
+enum { W_ON, W_LAN, W_ASK, W_NEWCODE, W_COUNT };
+static int web_rows(void) { return webadmin_ask_code() ? W_COUNT : W_NEWCODE; }   // the new code row only matters when a code is asked for
+static void web_item(int i, char *out, size_t cap) {
+    if (i == W_ON) snprintf(out, cap, " Web admin             < %s >", webadmin_enabled() ? "On" : "Off");
+    else if (i == W_LAN) snprintf(out, cap, " Also on the home Wi-Fi  < %s >", webadmin_lan() ? "Yes" : "No");
+    else if (i == W_ASK) snprintf(out, cap, " Ask for a code         < %s >", webadmin_ask_code() ? "Yes" : "No");
+    else snprintf(out, cap, " Make a new code");
 }
-static void draw_sync(void) {
+static void draw_web(void) {
     ov_clear();
-    const char *hint = " Esc ends sync";
+    const char *hint = " Up Down move   Left Right change   Enter select   Esc back";
     int end = orows - foot_h(hint);
-    int r = header("Sync with the computer") + 1;
-    char b[240], nm[100];
-    long done = 0, total = 0;
-    snprintf(b, sizeof b, " Connected to %s, %s", pc.name, sess_via_away() ? "through Tailscale" : "at home");
+    int r = header("Web admin") + 1;
+    char b[200], a[4][48];
+    snprintf(b, sizeof b, " Status  %s", webadmin_state_text());
     r = ov_text(r, 0, b, end);
-    snprintf(b, sizeof b, " Commands done  %d", syncd_ops());
-    r = ov_text(r, 0, b, end);
-    snprintf(b, sizeof b, " Last           %s", syncd_last());
-    r = ov_text(r + 1, 0, b, end);
-    if (syncd_transfer(nm, sizeof nm, &done, &total)) {
-        snprintf(b, sizeof b, " Now            %s", nm);
-        r = ov_text(r, 0, b, end);
-        int pct = total > 0 ? (int)(done * 100 / total) : 0;
-        char bar[33];
-        for (int i = 0; i < 32; i++) bar[i] = i < pct * 32 / 100 ? '#' : '-';
-        bar[32] = 0;
-        snprintf(b, sizeof b, " [%s] %d%%  %ld of %ld KB", bar, pct, done / 1024, total / 1024);
-        r = ov_text(r, 0, b, end);
-    }
-    r = ov_text(r + 1, 0, " Keep this screen open while the computer works. On the computer: a11helper sync-do status", end);
+    int n = webadmin_addresses(a);
+    if (n) {
+        r = ov_text(r + 1, 0, " Open one of these in a browser:", end);
+        for (int i = 0; i < n; i++) { snprintf(b, sizeof b, "   %s", a[i]); r = ov_text(r, 0, b, end); }
+    } else r = ov_text(r + 1, 0, " Not reachable yet. It needs Tailscale connected, or turn on the home Wi-Fi below.", end);
+    if (webadmin_ask_code()) { snprintf(b, sizeof b, " The page asks for this code:  %s", webadmin_code()); r = ov_text(r + 1, 0, b, end); }
+    draw_list(r + 1, end, web_rows(), web_sel, web_item);
     footer(hint);
 }
-static void key_sync(uint16_t code) {
-    if (code == HID_ESC) { sess_end(); state = UI_MENU; }
+static void key_web(uint16_t code) {
+    if (web_sel >= web_rows()) web_sel = web_rows() - 1;
+    if (code == HID_UP) web_sel = step(web_sel, -1, 0, web_rows() - 1);
+    else if (code == HID_DOWN) web_sel = step(web_sel, 1, 0, web_rows() - 1);
+    else if (code == HID_LEFT || code == HID_RIGHT || code == HID_ENTER) {
+        if (web_sel == W_ON) webadmin_set_enabled(!webadmin_enabled());
+        else if (web_sel == W_LAN) webadmin_set_lan(!webadmin_lan());
+        else if (web_sel == W_ASK) webadmin_set_ask_code(!webadmin_ask_code());
+        else if (code == HID_ENTER && web_sel == W_NEWCODE) { webadmin_new_code(); msg_show(UI_WEB, "New code %s. Anyone logged in on the page stays logged in until the Casio restarts", webadmin_code()); return; }
+    }
+    else if (code == HID_ESC) state = UI_MENU;
     redraw();
 }
 
@@ -717,7 +722,11 @@ enum { T_ON, T_KEY, T_AWAY, T_FORGET, T_COUNT };
 static bool ts_use_away = true;
 static const char *away_for_sessions(void) {
     if (!ts_use_away || tunnel_state() != TUN_CONNECTED || !pc.away[0]) return NULL;
-    return pc.away;
+    bool numeric = true;
+    for (const char *p = pc.away; *p; p++) if (!isdigit((unsigned char)*p) && *p != '.') numeric = false;
+    if (numeric) return pc.away;
+    static char resolved[24];
+    return tunnel_resolve(pc.away, resolved, sizeof resolved) ? resolved : NULL;   // a Tailscale name is looked up in the list of your devices
 }
 static void ts_item(int i, char *out, size_t cap) {
     if (i == T_ON) snprintf(out, cap, " Tailscale        < %s >", tunnel_enabled() ? "On" : "Off");
@@ -949,7 +958,7 @@ static void drop_parse(void) {
     }
     if (drop_sel >= ndrops) drop_sel = ndrops ? ndrops - 1 : 0;
 }
-static void drop_enter(void) {
+__attribute__((unused)) static void drop_enter(void) {
     if (net_state() != NET_CONNECTED) { msg_show(UI_MENU, "Wi-Fi is not connected. Open the GUI menu, Wi-Fi, and join a network"); return; }
     if (!pc.fp[0]) { msg_show(UI_MENU, "Not paired with a computer yet. Open the GUI menu, Computer, and press A to pair"); return; }
     if (!sdcard_mount()) { msg_show(UI_MENU, "No SD card, or it is not FAT32. Put in a FAT32 card and try again"); return; }
@@ -1120,12 +1129,6 @@ static void busy_tick(void) {
             if (strcmp(shown_code, sess_pair_code()) != 0) { snprintf(shown_code, sizeof shown_code, "%s", sess_pair_code()); redraw(); }
             return;
         }
-    } else if (busy_kind == BUSY_SYNC) {
-        if (st == SESS_ACTIVE) state = UI_SYNC;
-        else if (st == SESS_ERROR && sess_auth_failed()) { auto_pair(); }
-        else if (st == SESS_ERROR) { msg_show(UI_MENU, "%s", sess_error()); sess_end(); }
-        else if (st == SESS_DONE) { msg_show(UI_MENU, "The computer closed the connection. Check the helper is running, then try again"); sess_end(); }
-        else return;
     } else if (busy_kind == BUSY_DROPLIST) {
         if (st == SESS_DONE) { sess_end(); drop_parse(); state = UI_DROP; }
         else if (st == SESS_ERROR && sess_auth_failed()) { auto_pair(); }
@@ -1179,12 +1182,6 @@ void ui_tick(void) {
     if (sel_clear_at && now > sel_clear_at && !cm_active) { sel_clear_at = 0; last_tap_text[0] = 0; sel_clear(); }
     status_led_fast_sampling(state == UI_BATT);
     if (state == UI_BATT) { static int64_t last_batt; if (now - last_batt > 500000) { last_batt = now; redraw(); } }
-    if (state == UI_SYNC) {   // the computer is working on the card, so no sleep, and the screen follows along
-        last_input_us = now;
-        if (sess_state() != SESS_ACTIVE) { msg_show(UI_MENU, "Sync ended. Open the GUI menu, Sync with the computer, to start it again"); sess_end(); return; }
-        static int64_t last_sync_draw;
-        if (now - last_sync_draw > 500000) { last_sync_draw = now; redraw(); }
-    }
     // Sleep after a while without keys or touch, but only on battery unless the box is unticked.
     if (!asleep && AUTOSLEEP_MIN[autosleep_idx] && now - last_input_us > AUTOSLEEP_MIN[autosleep_idx] * 60000000LL && !(nosleep_usb && on_usb_power())) {
         go_sleep();
@@ -1367,7 +1364,7 @@ static void key_pc(uint16_t code) {
         id_computer_t sel;
         bool have = pc_sel == pc_slot ? (sel = pc, pc.fp[0] != 0) : (id_computer_slot_load(pc_sel, &sel) && sel.fp[0]);
         if (!have) msg_show(UI_PC, "Pair that computer first. Press A on it in the Computer screen");
-        else input_start(IN_PC_AWAY, "Address to use when away from home, like a Tailscale name. Empty clears it.", sel.away, false, UI_PC);
+        else input_start(IN_PC_AWAY, "Away address: a Tailscale name like wozlap3, or a 100.x address. Empty clears it", sel.away, false, UI_PC);
     }
     else if (c == 'f') {
         if (pc_sel == pc_slot) { id_computer_forget(); memset(&pc, 0, sizeof pc); sess_set_target("", 2222, ""); settings_set_str(ls_key(), ""); last_session[0] = 0; }
@@ -1508,7 +1505,7 @@ static void redraw(void) {
         case UI_DROP: draw_drop(); break;
         case UI_THEMED: draw_themed(); break;
         case UI_TS: draw_ts(); break;
-        case UI_SYNC: draw_sync(); break;
+        case UI_WEB: draw_web(); break;
         case UI_THEME_LOAD: draw_theme_load(); break;
         case UI_HIST: draw_hist(); break;
         case UI_WIFI: draw_wifi(); break;
@@ -1733,8 +1730,8 @@ static int step(int v, int d, int lo, int hi) { v += d; return v < lo ? lo : v >
 
 static void key_menu(uint16_t code) {
     switch (code) {
-        case HID_UP: menu_sel = step(menu_sel, -1, 0, M_COUNT - 1); break;
-        case HID_DOWN: menu_sel = step(menu_sel, 1, 0, M_COUNT - 1); break;
+        case HID_UP: menu_sel = menu_sel > 0 ? menu_sel - 1 : M_COUNT - 1; break;   // wraps round, like the loader
+        case HID_DOWN: menu_sel = menu_sel < M_COUNT - 1 ? menu_sel + 1 : 0; break;
         case HID_LEFT:
         case HID_RIGHT: {
             int d = code == HID_RIGHT ? 1 : -1;
@@ -1752,11 +1749,12 @@ static void key_menu(uint16_t code) {
             else if (menu_sel == M_PC) state = UI_PC;
             else if (menu_sel == M_THEMED) { themed_enter(); }
             else if (menu_sel == M_TS) { ts_sel = 0; state = UI_TS; }
-            else if (menu_sel == M_DROP) { drop_enter(); return; }
-            else if (menu_sel == M_SYNC) { sync_enter(); return; }
+            else if (menu_sel == M_WEB) { web_sel = 0; state = UI_WEB; }
             else if (menu_sel == M_BATT) { batt_sel = 0; state = UI_BATT; }
             else if (menu_sel == M_SEC) { sec_sel = 0; state = UI_SEC; }
             else if (menu_sel == M_STATUS) state = UI_STATUS;
+            else if (menu_sel == M_FILES) { launch_app(2); return; }
+            else if (menu_sel == M_LIBRARY) { if (!app_switch("library")) msg_show(UI_MENU, "The Library is not installed yet. Open the loader and install library.bin from the card"); return; }
             else if (menu_sel == M_LOADER) to_loader();
             break;
         case HID_ESC: close_ui(); return;
@@ -1811,6 +1809,7 @@ void ui_init(const ui_callbacks_t *callbacks, int *cols, int *rows) {
     clipboard_init();
     id_init();
     tunnel_init();
+    webadmin_start();
     ts_use_away = settings_get("tsaway", 1) != 0;
     sess_set_away_provider(away_for_sessions);
     pc_slot = settings_get("pcact", 0);
@@ -2031,7 +2030,7 @@ static void lock_screen(void) {
 
 static void key_lock(uint16_t code) {
     int64_t now = esp_timer_get_time();
-    if (code == A11_KEY_ON && keystore_unlocked() && held_mask() == wake_mask) { unlock_now(); return; }   // the secret press
+    if (code == A11_KEY_ON && keystore_unlocked() && held_mask() == wake_mask) { hold_guard = true; hold_guard_t = esp_timer_get_time(); unlock_now(); return; }   // the secret press
     if (now < lockout_until) { snprintf(lock_msg, sizeof lock_msg, "Too many tries, wait a little."); redraw(); return; }
     char c = a11_hid_to_char(code, false, false);
     if (code == HID_BACKSPACE) { if (lock_len) lock_buf[--lock_len] = 0; lock_msg[0] = 0; }
@@ -2062,6 +2061,26 @@ static void unlock_now(void) {
 }
 
 // Off: drop the connection, radio and screen. The session keeps running on the computer, On brings it back.
+// A full screen app takes over keys and touch until it returns. Afterwards the terminal comes back, and whatever the app changed (theme, text size,
+// brightness) is picked up from the saved settings.
+static void launch_app(int which) {
+    if (!cb.run_app) return;
+    shift = ctrl = alt = gui = gui_tap = false;
+    state = UI_OFF;
+    int r = cb.run_app(which);
+    shift = ctrl = alt = gui = gui_tap = false;
+    int f = settings_get("font", font_idx);
+    theme_idx = settings_get("theme", theme_idx);
+    bright_idx = settings_get("bl", bright_idx);
+    if (bright_idx < 0 || bright_idx >= N_BRIGHT) bright_idx = N_BRIGHT - 1;
+    apply_theme();
+    apply_brightness();
+    if (f != font_idx) apply_font(f);
+    close_ui();
+    last_input_us = esp_timer_get_time();
+    if (r == 2) go_sleep();
+}
+
 static void go_sleep(void) {
     status_led_off(true);
     sel_clear();
@@ -2090,7 +2109,7 @@ static void wake(void) {
     a11_keys_set_slow(false);
     display_sleep(false);
     net_wake();
-    if (held_mask() == wake_mask && keystore_unlocked()) unlock_now();   // the secret press
+    if (held_mask() == wake_mask && keystore_unlocked()) { hold_guard = true; hold_guard_t = esp_timer_get_time(); unlock_now(); }   // the secret press
     else { lock_screen(); }
 }
 
@@ -2239,6 +2258,7 @@ bool ui_handle(a11_event_t *evp) {
     else if (code == A11_HID_LEFT_ALT) alt = ev.down;
     else if (code == A11_HID_LEFT_GUI) gui = ev.down;
     else if (ev.down) shift_other_key = true;
+    if (hold_guard && ((!ev.down && (code == A11_HID_LEFT_CTRL || code == A11_HID_LEFT_GUI) && !ctrl && !gui) || now - hold_guard_t > 4000000)) hold_guard = false;   // both are up, or four seconds went by, shortcuts work again
 
     if (asleep) {   // only On does anything
         if (code == A11_KEY_ON && ev.down) wake();
@@ -2251,7 +2271,8 @@ bool ui_handle(a11_event_t *evp) {
         if (state == UI_LOCK || state == UI_SEC_CAPTURE) return true;
         if (ev.down) {
             gui_tap = true;
-            if (ctrl) {
+            if (hold_guard) { gui_tap = false; }   // still the keys from the secret press, not a shortcut
+            else if (ctrl) {
                 gui_tap = false;
                 if (state == UI_CLIP) close_ui();
                 else { clip_sel = 0; open_ui(UI_CLIP); redraw(); }
@@ -2280,6 +2301,13 @@ bool ui_handle(a11_event_t *evp) {
         if (now - last_font_t > 400000) { last_font_t = now; apply_font(font_idx + (code == HID_EQUALS ? 1 : -1)); if (state == UI_HIST) hist_build(); redraw(); }
         return true;
     }
+    // The brightness button works in every menu too, not only in the terminal. The menu row shows the new level.
+    if (state != UI_OFF && state != UI_SEC_CAPTURE && code == A11_KEY_BACKLIGHT) {
+        bright_idx = bright_idx == 0 ? N_BRIGHT - 1 : bright_idx - 1;
+        apply_brightness();
+        redraw();
+        return true;
+    }
     if (state == UI_OFF && cm_active) return cm_key(code);
     if (state == UI_OFF) return hotkeys(code);
     switch (state) {
@@ -2300,7 +2328,7 @@ bool ui_handle(a11_event_t *evp) {
         case UI_DROP: key_drop(code); break;
         case UI_THEMED: key_themed(code); break;
         case UI_TS: key_ts(code); break;
-        case UI_SYNC: key_sync(code); break;
+        case UI_WEB: key_web(code); break;
         case UI_THEME_LOAD: key_theme_load(code); break;
         case UI_HIST: key_hist(code); break;
         case UI_SEC: key_sec(code); break;
@@ -2376,7 +2404,7 @@ void ui_ready(void) {
         uint16_t codes[16];
         int n = a11_keys_wake_held(codes, 16), m = 0;
         for (int i = 0; i < n; i++) m |= codes[i] == A11_HID_LEFT_SHIFT ? MOD_SHIFT : codes[i] == A11_HID_LEFT_CTRL ? MOD_CTRL : codes[i] == A11_HID_LEFT_ALT ? MOD_ALT : codes[i] == A11_HID_LEFT_GUI ? MOD_GUI : 0;
-        if (n >= 0 && m == wake_mask && keystore_take_stash()) { id_unlock(); net_unlock(); opened = true; }   // the secret press, no PIN
+        if (n >= 0 && m == wake_mask && keystore_take_stash()) { id_unlock(); net_unlock(); opened = true; hold_guard = true; hold_guard_t = esp_timer_get_time(); }   // the secret press, no PIN
     }
     keystore_wipe_stash();   // anything but the secret press leaves nothing behind
     if (!opened) lock_screen();

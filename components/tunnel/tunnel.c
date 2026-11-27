@@ -106,6 +106,14 @@ bool tunnel_login_url(char *out, size_t cap) {
     return true;
 }
 
+bool tunnel_resolve(const char *name, char *out, size_t cap) {
+    if (!ml || st != TUN_CONNECTED || !name || !name[0]) return false;
+    uint32_t ip = microlink_resolve(ml, name);
+    if (!ip) return false;
+    snprintf(out, cap, "%u.%u.%u.%u", (unsigned)((ip >> 24) & 255), (unsigned)((ip >> 16) & 255), (unsigned)((ip >> 8) & 255), (unsigned)(ip & 255));
+    return true;
+}
+
 void tunnel_forget(void) {
     if (started && ml) { microlink_stop(ml); microlink_destroy(ml); ml = NULL; started = false; }
     microlink_factory_reset();

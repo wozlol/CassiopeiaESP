@@ -1,6 +1,8 @@
 #include "sdcard.h"
 #include "board.h"
 #include "esp_log.h"
+#include <sys/stat.h>
+#include <stdio.h>
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
@@ -21,6 +23,10 @@ bool sdcard_mount(void) {
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
     esp_err_t e = esp_vfs_fat_sdmmc_mount(SDCARD_MOUNT, &host, &slot, &mc, &card);
     ok = e == ESP_OK;
+    if (ok) {   // the four folders everything lives in, made if they are not there. downloads is the hopper for general files
+        static const char *const DIRS[] = {"library", "media", "modes", "downloads"};
+        for (int i = 0; i < 4; i++) { char p[40]; snprintf(p, sizeof p, "%s/%s", SDCARD_MOUNT, DIRS[i]); mkdir(p, 0777); }
+    }
     if (ok) ESP_LOGI(TAG, "SD mounted, %llu MB", (unsigned long long)card->csd.capacity * card->csd.sector_size / (1024 * 1024));
     else ESP_LOGW(TAG, "SD mount failed (%s), it needs a FAT32 card", esp_err_to_name(e));
     return ok;

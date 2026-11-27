@@ -22,4 +22,5 @@ void tunnel_set_enabled(bool on);               // on: joins with what is saved,
 void tunnel_join_with_key(const char *auth_key);   // a one-time key from the Tailscale admin page, tagged for this device. It is not kept.
 bool tunnel_ip(char *out, size_t cap);          // this device's 100.x address while connected
 bool tunnel_login_url(char *out, size_t cap);   // the link to open while TUN_NEEDS_LOGIN
+bool tunnel_resolve(const char *name, char *out, size_t cap);   // a Tailscale name like wozlap3 to its 100.x address, false if unknown or not connected
 void tunnel_forget(void);                       // stops and wipes this device's Tailscale keys. It must be removed in the admin page too.

@@ -84,7 +84,7 @@ static void sendf(const char *fmt, ...) {
 static bool path_ok(const char *p) {
     size_t n = strlen(p);
     if (n < 7 || n > 160) return false;
-    if (strncmp(p, "modes/", 6) && strncmp(p, "library/", 8) && strncmp(p, "media/", 6)) return false;
+    if (strncmp(p, "modes/", 6) && strncmp(p, "library/", 8) && strncmp(p, "media/", 6) && strncmp(p, "downloads/", 10)) return false;
     if (strstr(p, "..") || p[n - 1] == '/') return false;
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)p[i];
@@ -151,7 +151,7 @@ static int list_walk(const char *base, const char *rel, int depth, int *count) {
     return 1;
 }
 static void cmd_list(const char *dir) {
-    if (!(path_ok(dir) || !strcmp(dir, "modes") || !strcmp(dir, "library") || !strcmp(dir, "media"))) { sendf("ERR\tbad folder\n"); return; }
+    if (!(path_ok(dir) || !strcmp(dir, "modes") || !strcmp(dir, "library") || !strcmp(dir, "media") || !strcmp(dir, "downloads"))) { sendf("ERR\tbad folder\n"); return; }
     int count = 0;
     list_walk(dir, "", 0, &count);
     sendf("END\n");
