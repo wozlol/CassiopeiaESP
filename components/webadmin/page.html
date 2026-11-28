@@ -64,16 +64,16 @@ async function go(d){dir=d;crumbs();say($('msg'),'');const rows=$('rows');rows.i
   tr.append(n,s,ac);rows.appendChild(tr)}
  if(!j.items.length)rows.innerHTML='<tr><td colspan="3" style="color:var(--dim)">Empty</td></tr>';
  }catch(e){if(e.message!=='login')say($('msg'),String(e.message),true)}}
-async function remove(p,isdir){if(!confirm('Delete '+p+(isdir?' and everything in it':'')+'? This cannot be undone.'))return;try{await api('/api/'+(isdir?'dir':'file')+'?path='+encodeURIComponent(p),{method:'DELETE'});go(dir);info()}catch(e){say($('msg'),String(e.message),true)}}
+async function remove(p,isdir){if(!confirm('Delete '+p+(isdir?' and everything in it':'')+'? This cannot be undone.'))return;try{await api('/api/'+(isdir?'dir':'file')+'?confirm=1&path='+encodeURIComponent(p),{method:'DELETE'});go(dir);info()}catch(e){say($('msg'),String(e.message),true)}}
 async function install(p,slot){say($('msg'),'Installing '+p+' in slot '+slot+', this takes up to a minute');try{const t=await (await api('/api/install?path='+encodeURIComponent(p)+'&slot='+slot,{method:'POST'})).text();say($('msg'),t)}catch(e){say($('msg'),String(e.message),true)}}
-function upload(files){if(!dir){say($('msg'),'Open modes, library or media first, files go into a folder.',true);return}
- let i=0;const next=()=>{if(i>=files.length){go(dir);info();return}const f=files[i++];const path=(dir+'/'+f.name);
+function upload(files){
+ let i=0;const next=()=>{if(i>=files.length){go(dir);info();return}const f=files[i++];const path=(dir?dir+'/':'')+f.name;
   const x=new XMLHttpRequest();x.open('PUT','/api/file?path='+encodeURIComponent(path));x.setRequestHeader('X-A11','1');
   const bar=document.createElement('div');bar.className='prog';bar.innerHTML='<i></i>';$('prog').innerHTML='';$('prog').appendChild(bar);
   x.upload.onprogress=e=>{bar.firstChild.style.width=(e.loaded*100/e.total)+'%';say($('msg'),'Sending '+f.name+'  '+fmt(e.loaded)+' of '+fmt(e.total))};
   x.onload=()=>{if(x.status===401){showLogin();return}if(x.status>=300){say($('msg'),f.name+': '+x.responseText,true);return}next()};
   x.onerror=()=>say($('msg'),'The connection dropped while sending '+f.name,true);x.send(f)};next()}
-async function mkdir(){if(!dir){say($('msg'),'Open modes, library or media first.',true);return}const n=prompt('Name of the new folder');if(!n)return;try{await api('/api/mkdir?path='+encodeURIComponent(dir+'/'+n),{method:'POST'});go(dir)}catch(e){say($('msg'),String(e.message),true)}}
+async function mkdir(){const n=prompt('Name of the new folder');if(!n)return;try{await api('/api/mkdir?path='+encodeURIComponent((dir?dir+'/':'')+n),{method:'POST'});go(dir)}catch(e){say($('msg'),String(e.message),true)}}
 async function clips(){const j=await (await api('/api/clips')).json();const box=$('cl');box.innerHTML='';
  j.clips.forEach((t,i)=>{const d=document.createElement('div');d.className='clip';const ta=document.createElement('textarea');ta.value=t;
   const save=document.createElement('button');save.textContent='Save';save.onclick=async()=>{try{await api('/api/clips/'+(i+1),{method:'PUT',body:ta.value});say($('cmsg'),'Saved clip '+(i+1))}catch(e){say($('cmsg'),String(e.message),true)}};

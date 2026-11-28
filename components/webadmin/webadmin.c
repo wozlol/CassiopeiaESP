@@ -138,13 +138,16 @@ static bool chars_ok(const char *p) {
     }
     return true;
 }
-static bool is_root(const char *p) { return !strcmp(p, "modes") || !strcmp(p, "library") || !strcmp(p, "media") || !strcmp(p, "downloads"); }
-static bool under_root(const char *p) { return !strncmp(p, "modes/", 6) || !strncmp(p, "library/", 8) || !strncmp(p, "media/", 6) || !strncmp(p, "downloads/", 10); }
-static bool path_ok(const char *p) {   // a file or folder below a root
+// Any file or folder on the card. No parent steps, no hidden names, no odd characters.
+static bool path_ok(const char *p) {
     size_t n = strlen(p);
-    return n >= 7 && n <= 180 && under_root(p) && !strstr(p, "..") && p[n - 1] != '/' && chars_ok(p) && !strstr(p, "//");
+    if (n < 1 || n > 180 || p[0] == '/' || p[n - 1] == '/' || strstr(p, "..") || strstr(p, "//") || !chars_ok(p)) return false;
+    for (const char *q = p; *q; q++) if (*q == '/' && q[1] == '.') return false;   // no hidden names below either
+    return p[0] != '.';
 }
-static bool dir_ok(const char *p) { return is_root(p) || path_ok(p); }
+static bool dir_ok(const char *p) { return path_ok(p); }
+// The folders the programs on the handheld expect. They can be emptied but not deleted by one click.
+static bool core_folder(const char *p) { return !strcmp(p, "modes") || !strcmp(p, "library") || !strcmp(p, "media") || !strcmp(p, "downloads"); }
 static void full(const char *card, char *out, size_t cap) { snprintf(out, cap, "%s/%s", SDCARD_MOUNT, card); }
 static void mkdirs_for(const char *fullp) {
     char p[400];
@@ -184,16 +187,13 @@ static void api_ls(int fd, const req_t *r) {
     head(fd, 200, "application/json", -1, NULL);
     send_all(fd, "{\"items\":[", 10);
     bool first = true;
-    if (!dir[0]) {
-        static const char *roots[] = {"downloads", "modes", "library", "media"};
-        for (int i = 0; i < 4; i++) { char b[60]; snprintf(b, sizeof b, "%s{\"n\":\"%s\",\"d\":1}", first ? "" : ",", roots[i]); send_all(fd, b, strlen(b)); first = false; }
-    } else if (dir_ok(dir)) {
+    if (!dir[0] || dir_ok(dir)) {
         char fp[300];
-        full(dir, fp, sizeof fp);
+        if (dir[0]) full(dir, fp, sizeof fp); else snprintf(fp, sizeof fp, "%s", SDCARD_MOUNT);
         DIR *d = opendir(fp);
         struct dirent *e;
         while (d && (e = readdir(d)) != NULL) {
-            if (e->d_name[0] == '.') continue;
+            if (e->d_name[0] == '.' || (!dir[0] && !strcmp(e->d_name, "System Volume Information"))) continue;
             char child[700];
             snprintf(child, sizeof child, "%s/%s", fp, e->d_name);
             struct stat st;
@@ -231,7 +231,7 @@ static void api_get_file(int fd, const req_t *r) {
 }
 static void api_put_file(int fd, const req_t *r, const char *lead, size_t lead_n) {
     char p[200], fp[300], part[320];
-    if (!qget(r, "path", p, sizeof p) || !path_ok(p)) { say(fd, 400, "bad path, use a folder under modes, library or media"); return; }
+    if (!qget(r, "path", p, sizeof p) || !path_ok(p)) { say(fd, 400, "bad folder name"); return; }
     full(p, fp, sizeof fp);
     snprintf(part, sizeof part, "%s.part", fp);
     mkdirs_for(fp);
@@ -258,11 +258,13 @@ static void api_put_file(int fd, const req_t *r, const char *lead, size_t lead_n
     say(fd, 200, "ok");
 }
 static void api_delete(int fd, const req_t *r, bool tree) {
-    char p[200], fp[300];
+    char p[200], fp[300], yes[8] = "";
     if (!qget(r, "path", p, sizeof p) || !path_ok(p)) { say(fd, 400, "bad path"); return; }
+    if (!qget(r, "confirm", yes, sizeof yes) || strcmp(yes, "1")) { say(fd, 400, "Deleting needs a confirmation. The page asks before it deletes."); return; }   // only the page's own question sets this
     full(p, fp, sizeof fp);
     struct stat st;
     if (stat(fp, &st) != 0) { say(fd, 404, "no such file or folder"); return; }
+    if (tree && core_folder(p)) { say(fd, 400, "That folder is needed by the handheld. Delete what is inside it instead."); return; }
     if (tree) rm_tree(fp, 0); else remove(fp);
     say(fd, stat(fp, &st) != 0 ? 200 : 500, stat(fp, &st) != 0 ? "ok" : "could not remove it");
 }
