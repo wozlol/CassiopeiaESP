@@ -6,7 +6,9 @@
 @media (prefers-color-scheme: light){:root{--bg:#f4f6f1;--fg:#1d261b;--dim:#5b6858;--acc:#2f7d12;--card:#fff;--line:#d3dbd0;--bad:#b32121}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
 main{max-width:56rem;margin:0 auto;padding:1rem}
-h1{font-size:1.3rem;margin:.2rem 0 .8rem}a{color:var(--acc)}
+h1{font-size:1.3rem;margin:.2rem 0 .8rem;display:flex;align-items:center;gap:.6rem}a{color:var(--acc)}
+.logo{width:2.2rem;height:2.2rem;fill:var(--fg);flex:none}h1 a{display:inline-flex}
+footer{margin:2rem 0 .5rem;padding-top:.8rem;border-top:1px solid var(--line);color:var(--dim);font-size:.85rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}footer .logo{width:1.2rem;height:1.2rem;fill:var(--dim)}footer a{color:var(--dim)}footer a:hover{color:var(--acc)}
 .bar{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center;margin:.6rem 0}
 button,select,input,textarea{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:.35rem .7rem}
 button{cursor:pointer}button:hover{border-color:var(--acc)}button.go{background:var(--acc);color:#0b0d0b;border-color:var(--acc)}
@@ -19,10 +21,12 @@ td.n{word-break:break-all}td.s,td.a{white-space:nowrap}td.s{color:var(--dim);tex
 .clip{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:.5rem;margin:.5rem 0}.clip textarea{width:100%;min-height:3.2rem}
 .prog{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin:.3rem 0}.prog i{display:block;height:100%;background:var(--acc);width:0}
 #login{max-width:20rem;margin:20vh auto}#login input{width:100%;margin:.6rem 0;font-size:1.3rem;letter-spacing:.3em;text-align:center}
-</style></head><body><main>
-<div id="login" hidden><h1>woz.lol</h1><div>Type the code shown on the device, GUI menu, Web admin.</div><input id="code" inputmode="numeric" autocomplete="off" maxlength="6"><button class="go" id="loginbtn" style="width:100%">Open</button><div class="msg bad" id="lmsg"></div></div>
+</style></head><body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><symbol id="wl" viewBox="0 0 566.93 566.93"><path fill-rule="evenodd" d="M536.6,30.33h-149.69c-.76,8.42-1.67,20.33-2.38,31.66-1.09,17.33-2.43,34.42-2.98,38-1.05,6.85-1.72,14.39-5.01,56.5-2.82,36.07-4.99,63.11-6.07,75.5-.5,5.77-1.2,14.55-1.55,19.5s-1.04,11.17-1.53,13.83c-.83,4.45-2.17,21.45-3.78,47.67-.63,10.32-.69,10.51-3.2,10.8-1.5.17-3.72-.62-5.38-1.93-2.52-1.98-31.18-20.82-45.51-29.92-2.99-1.9-10.39-6.72-16.43-10.71-6.04-3.99-11.61-7.25-12.37-7.25s-8.44,4.65-17.07,10.34c-29.93,19.73-44.71,29.33-50.81,32.98-3.37,2.02-6.69,4.35-7.37,5.17-.69.83-2.53,1.5-4.11,1.5-2.21,0-3-.56-3.49-2.5-.35-1.37-.38-3.14-.08-3.92.52-1.35-.18-11.29-3.8-54.08-.84-9.9-1.97-24.75-2.52-33s-1.67-21.98-2.5-30.5c-.83-8.53-2.18-22.48-3.01-31-.83-8.53-1.97-22.7-2.53-31.5-1.62-25.31-2.92-41.91-4.46-57-.79-7.7-1.91-20.08-2.5-27.5-.65-8.25-1.31-15.33-2.1-22.66H30.33v506.27h506.27V30.33ZM210.99,370.06c3.04-1.72,12.38-7.57,20.75-13,8.37-5.43,19.64-12.73,25.05-16.22,5.41-3.49,12.82-8.48,16.47-11.1,3.65-2.61,7.01-4.75,7.45-4.75s5.41,3.1,11.03,6.9c18.71,12.63,49.2,32.36,61.53,39.83,3.41,2.06,2.47,5.29-2.31,8.03-2.2,1.26-9.28,5.77-15.75,10.02-23.79,15.65-49.95,32.76-52.2,34.16-2.2,1.36-3.16.88-18.8-9.5-9.07-6.02-24.89-16.34-35.15-22.94-22.35-14.37-23.6-15.27-23.6-16.98,0-.73,2.49-2.74,5.53-4.45ZM435.96,421.19l-2.5,1.99c-2.23,1.78-14.69,9.92-43.24,28.26-5.09,3.27-16.91,10.95-26.26,17.06s-26.34,17.16-37.77,24.55c-11.42,7.39-25.81,16.76-31.98,20.81-6.17,4.05-12.12,7.42-13.23,7.48s-10.12-5.19-20.02-11.67c-9.9-6.48-28.8-18.78-42-27.34-13.2-8.56-28.95-18.82-35-22.82-6.05-3.99-15.5-10.16-21-13.7-28.54-18.38-35.67-23.28-36.68-25.16-1.12-2.09-1.26-41.14-.16-42.92.72-1.17,2.51-.4,7.59,3.27,4.39,3.17,6.29,4.42,45.75,30.03,12.92,8.39,29.12,18.93,36,23.42,6.88,4.49,17.67,11.52,23.99,15.6,6.32,4.09,17.74,11.6,25.38,16.68s14.86,9.25,16.06,9.25,4.85-1.93,8.12-4.28c3.27-2.36,9.78-6.71,14.45-9.66,11.01-6.97,21.46-13.74,43-27.9,9.62-6.32,22-14.28,27.5-17.69,5.5-3.41,16.34-10.42,24.1-15.58s17.43-11.54,21.5-14.17c4.07-2.63,8.93-5.89,10.8-7.25,2.18-1.58,3.79-2.14,4.5-1.55.74.61,1.1,7.89,1.1,22.1v21.18Z"/></symbol></svg>
+<main>
+<div id="login" hidden><h1><a href="https://woz.lol" target="_blank" rel="noopener" aria-label="woz.lol"><svg class="logo"><use href="#wl"/></svg></a>woz.lol</h1><div>Type the code shown on the device, GUI menu, Web admin.</div><input id="code" inputmode="numeric" autocomplete="off" maxlength="6"><button class="go" id="loginbtn" style="width:100%">Open</button><div class="msg bad" id="lmsg"></div></div>
 <div id="app" hidden>
-<h1>woz.lol <span id="info" style="font-size:.85rem;color:var(--dim);font-weight:400"></span></h1>
+<h1><a href="https://woz.lol" target="_blank" rel="noopener" aria-label="woz.lol"><svg class="logo"><use href="#wl"/></svg></a>woz.lol <span id="info" style="font-size:.85rem;color:var(--dim);font-weight:400"></span></h1>
 <div class="tabs"><button id="t1" class="on">SD card files</button> <button id="t2">Clipboard</button></div>
 <section id="files">
  <div class="bar"><b id="crumbs"></b><span style="flex:1"></span><button id="up">Up</button><button id="mk">New folder</button><button id="rf">Refresh</button></div>
@@ -34,7 +38,8 @@ td.n{word-break:break-all}td.s,td.a{white-space:nowrap}td.s{color:var(--dim);tex
  <div class="bar"><button class="go" id="addclip">Add a clip</button><button id="rfc">Refresh</button></div>
  <div class="msg" id="cmsg"></div><div id="cl"></div>
 </section>
-</div></main>
+</div><footer><a href="https://woz.lol" target="_blank" rel="noopener" aria-label="woz.lol"><svg class="logo"><use href="#wl"/></svg></a><span><a href="https://woz.lol" target="_blank" rel="noopener">woz.lol</a> handheld web admin</span><span id="ver"></span></footer>
+</main>
 <script>
 const H={'X-A11':'1'};let dir='';
 const $=id=>document.getElementById(id);
@@ -43,7 +48,7 @@ function showLogin(){$('app').hidden=true;$('login').hidden=false;$('code').focu
 function fmt(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(2)+' GB'}
 function say(el,t,bad){el.textContent=t;el.className='msg'+(bad?' bad':'')}
 async function login(){try{const r=await fetch('/api/login',{method:'POST',headers:H,body:$('code').value});if(!r.ok){say($('lmsg'),await r.text(),true);return}$('login').hidden=true;start()}catch(e){say($('lmsg'),String(e),true)}}
-async function info(){const j=await (await api('/api/info')).json();$('info').textContent=j.free!==undefined?`v${j.version}  ·  ${fmt(j.free)} free of ${fmt(j.total)}  ·  running ${j.running}`:''}
+async function info(){const j=await (await api('/api/info')).json();$('ver').textContent=j.version?'v'+j.version:'';$('info').textContent=j.free!==undefined?`${fmt(j.free)} free of ${fmt(j.total)}  ·  running ${j.running}`:''}
 function crumbs(){const parts=dir?dir.split('/'):[];let h='<a href="#" data-d="">card</a>',p='';for(const x of parts){p+=(p?'/':'')+x;h+=' / <a href="#" data-d="'+p+'">'+x+'</a>'}$('crumbs').innerHTML=h;$('crumbs').querySelectorAll('a').forEach(a=>a.onclick=e=>{e.preventDefault();go(a.dataset.d)})}
 async function go(d){dir=d;crumbs();say($('msg'),'');const rows=$('rows');rows.innerHTML='';
  try{const j=await (await api('/api/ls?dir='+encodeURIComponent(dir))).json();
