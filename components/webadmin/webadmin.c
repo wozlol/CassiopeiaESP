@@ -223,9 +223,9 @@ static void api_get_file(int fd, const req_t *r) {
     char extra[300];
     snprintf(extra, sizeof extra, "Content-Disposition: attachment; filename=\"%s\"\r\n", name ? name + 1 : p);
     head(fd, 200, "application/octet-stream", (long)st.st_size, extra);
-    char *buf = malloc(4096);
+    char *buf = malloc(16384);
     size_t n;
-    while (buf && (n = fread(buf, 1, 4096, f)) > 0) if (!send_all(fd, buf, n)) break;
+    while (buf && (n = fread(buf, 1, 16384, f)) > 0) if (!send_all(fd, buf, n)) break;
     free(buf);
     fclose(f);
 }
@@ -240,11 +240,11 @@ static void api_put_file(int fd, const req_t *r, const char *lead, size_t lead_n
     long left = r->clen;
     bool ok = true;
     if (lead_n) { size_t n = lead_n > (size_t)left ? (size_t)left : lead_n; ok = fwrite(lead, 1, n, f) == n; left -= (long)n; }
-    char *buf = malloc(4096);
+    char *buf = malloc(16384);
     struct timeval tv = {20, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     while (ok && left > 0 && buf) {
-        int k = recv(fd, buf, left > 4096 ? 4096 : (int)left, 0);
+        int k = recv(fd, buf, left > 16384 ? 16384 : (int)left, 0);
         if (k <= 0) { ok = false; break; }
         ok = fwrite(buf, 1, (size_t)k, f) == (size_t)k;
         left -= k;
@@ -460,7 +460,9 @@ static void handle(int fd) {
 }
 static void conn_task(void *arg) {
     int fd = (int)(intptr_t)arg;
+    net_boost(true);   // power saving holds packets back, a transfer runs several times faster without it
     handle(fd);
+    net_boost(false);
     shutdown(fd, SHUT_RDWR);
     close(fd);
     conns--;

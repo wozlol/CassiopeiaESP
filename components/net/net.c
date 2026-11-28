@@ -8,6 +8,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "lwip/sockets.h"
 #include "esp_timer.h"
 #include "nvs.h"
@@ -247,3 +248,14 @@ int net_signal_percent(void) {
     int p = 2 * (ap.rssi + 100);   // about -50 dBm and better is full, -100 dBm and worse is empty
     return p < 0 ? 0 : p > 100 ? 100 : p;
 }
+
+void net_boost(bool on) {
+    static int users;
+    static SemaphoreHandle_t lock;
+    if (!lock) lock = xSemaphoreCreateMutex();
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (on) { if (users++ == 0) esp_wifi_set_ps(WIFI_PS_NONE); }
+    else if (users > 0 && --users == 0) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // the default power saving again
+    xSemaphoreGive(lock);
+}
+

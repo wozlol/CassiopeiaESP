@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "jpeg_decoder.h"
 #include "miniz.h"
+#include "rom/tjpgd.h"
 #include "jpeg_dc.h"
 #include "stb_image.h"
 
@@ -35,6 +36,71 @@ static const char *TAG = "imgview";
 static char err_text[160] = "";
 const char *imgview_error(void) { return err_text; }
 static bool fail(const char *t) { snprintf(err_text, sizeof err_text, "%s", t); ESP_LOGW(TAG, "%s", t); return false; }
+
+// ---------- a heart for favorites ----------
+static const uint16_t HEART[8] = {0x0C6, 0x1EF, 0x1FF, 0x1FF, 0x0FE, 0x07C, 0x038, 0x010};   // 9 wide, 8 high, bit 8 is the left column
+static bool heart_on;
+void imgview_draw_heart(uint16_t *buf, int stride, int height, int x, int y, int scale) {
+    for (int pass = 0; pass < 2; pass++) {   // a dark edge first so it shows on a bright picture, then the white heart on top
+        int grow = pass == 0 ? 1 : 0;
+        uint16_t colour = pass == 0 ? 0x0000 : 0xFFFF;
+        for (int r = 0; r < 8; r++) for (int c = 0; c < 9; c++) if (HEART[r] & (0x100 >> c)) {
+            int x0 = x + c * scale - grow, y0 = y + r * scale - grow, x1 = x + (c + 1) * scale + grow, y1 = y + (r + 1) * scale + grow;
+            for (int py = y0; py < y1; py++) for (int px = x0; px < x1; px++) if (px >= 0 && px < stride && py >= 0 && py < height) buf[(size_t)py * stride + px] = colour;
+        }
+    }
+}
+
+// ---------- the camera's notes inside a JPEG: which way it was held, and a small preview ----------
+static uint16_t rd16(const uint8_t *p, bool le) { return le ? (uint16_t)(p[0] | (p[1] << 8)) : (uint16_t)((p[0] << 8) | p[1]); }
+static uint32_t rd32(const uint8_t *p, bool le) { return le ? ((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24)) : (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]); }
+// d is the start of a JPEG and n how much of it is here. Sets the orientation (1 to 8) and where the small preview is, from the start of d.
+static void exif_scan(const uint8_t *d, size_t n, int *orient, size_t *toff, size_t *tlen) {
+    *orient = 1; *toff = *tlen = 0;
+    for (size_t i = 2; i + 4 <= n && d[i] == 0xFF;) {
+        uint8_t m = d[i + 1];
+        if (m == 0xDA || m == 0xD9) break;
+        size_t sl = ((size_t)d[i + 2] << 8) | d[i + 3];
+        if (m == 0xE1 && i + 16 <= n && !memcmp(d + i + 4, "Exif\0\0", 6)) {
+            const uint8_t *T = d + i + 10;
+            size_t avail = sl >= 8 ? sl - 8 : 0;
+            if (i + 10 + avail > n) avail = n - i - 10;
+            if (avail < 16) return;
+            bool le = T[0] == 'I';
+            if (!(T[0] == 'I' || T[0] == 'M')) return;
+            uint32_t ifd = rd32(T + 4, le);
+            for (int pass = 0; pass < 2 && ifd && ifd + 2 <= avail; pass++) {
+                int cnt = rd16(T + ifd, le);
+                if (ifd + 2 + (size_t)cnt * 12 + 4 > avail) return;
+                uint32_t off = 0, len = 0;
+                for (int e = 0; e < cnt; e++) {
+                    const uint8_t *en = T + ifd + 2 + (size_t)e * 12;
+                    uint16_t tag = rd16(en, le);
+                    if (pass == 0 && tag == 0x0112) { int o = rd16(en + 8, le); if (o >= 1 && o <= 8) *orient = o; }
+                    if (pass == 1 && tag == 0x0201) off = rd32(en + 8, le);
+                    if (pass == 1 && tag == 0x0202) len = rd32(en + 8, le);
+                }
+                if (pass == 1 && off && len && (size_t)off + len <= avail) { *toff = i + 10 + off; *tlen = len; }
+                ifd = rd32(T + ifd + 2 + (size_t)cnt * 12, le);   // the next list is the preview's
+            }
+            return;
+        }
+        i += 2 + sl;
+    }
+}
+// Where a pixel of the picture as it should be seen comes from in the picture as it is stored. rw and rh are the stored size.
+static inline void orient_map(int o, int ox, int oy, int rw, int rh, int *rx, int *ry) {
+    switch (o) {
+        case 2: *rx = rw - 1 - ox; *ry = oy; break;
+        case 3: *rx = rw - 1 - ox; *ry = rh - 1 - oy; break;
+        case 4: *rx = ox; *ry = rh - 1 - oy; break;
+        case 5: *rx = oy; *ry = ox; break;
+        case 6: *rx = oy; *ry = rh - 1 - ox; break;
+        case 7: *rx = rw - 1 - oy; *ry = rh - 1 - ox; break;
+        case 8: *rx = rw - 1 - oy; *ry = ox; break;
+        default: *rx = ox; *ry = oy; break;
+    }
+}
 
 // ---------- a small label painted over the screen while something takes time ----------
 static const uint8_t GLYPH[][7] = {   // 5 wide, 7 high, one bit per column, left column is bit 4
@@ -106,17 +172,20 @@ static void progress(int pct) {
 typedef enum { K_JPEG, K_PNG, K_RAW } kind_t;   // K_RAW: already decoded in full by the general decoder
 typedef struct { uint16_t *px; int w, h, den; } raster_t;
 static uint8_t *src; static uint32_t src_len; static kind_t kind;
+static FILE *jfile;   // a baseline JPEG that is read from the card as it is decoded, so a big camera file never has to be held whole
 static int fw, fh;                          // the whole picture
 static raster_t R[2];                       // [0] a small copy for the whole picture view, [1] the finest copy that fits in memory
 static float zs[MAX_STEPS]; static int nz, zi;   // the zoom steps and the one showing
 static float cx = 0.5f, cy = 0.5f;          // the middle of the view, as a share of the whole picture
+static int orient = 1, rawW, rawH;           // which way the camera was held, and the size of the picture as it is stored. fw and fh are the size as it is seen
+static void apply_orient(void) { rawW = fw; rawH = fh; if (orient >= 5) { fw = rawH; fh = rawW; } }
 static int raw_den = 1;                     // for a picture decoded in full by the general decoder this is 1, for the one eighth copy of a progressive JPEG it is 8
 static int den_min = 1, den_over = 1;       // the finest shrink that fits in memory, and the shrink of the small copy
 static bool is_open;
 static int64_t render_end_us, render_ms;    // keys that piled up during a slow load are ignored for a moment after it
 
 static void free_rasters(void) { for (int i = 0; i < 2; i++) { free(R[i].px); R[i].px = NULL; R[i].w = R[i].h = R[i].den = 0; } }
-static void free_all(void) { free_rasters(); free(src); src = NULL; src_len = 0; }
+static void free_all(void) { free_rasters(); free(src); src = NULL; src_len = 0; if (jfile) { fclose(jfile); jfile = NULL; } }
 
 // ---------- PNG ----------
 static void progress(int pct);
@@ -268,29 +337,61 @@ done:
 }
 
 // ---------- decoding to the size the view needs ----------
+// ---------- JPEG read as it goes ----------
+typedef struct { FILE *f; const uint8_t *mem; size_t len, pos; uint16_t *out; int ow, oh; } jsx_t;
+static UINT jsx_in(JDEC *jd, BYTE *buf, UINT n) {
+    jsx_t *c = (jsx_t *)jd->device;
+    if (c->f) {
+        if (buf) return (UINT)fread(buf, 1, n, c->f);
+        return fseek(c->f, (long)n, SEEK_CUR) == 0 ? n : 0;
+    }
+    UINT left = c->len > c->pos ? (UINT)(c->len - c->pos) : 0;
+    if (n > left) n = left;
+    if (buf) memcpy(buf, c->mem + c->pos, n);
+    c->pos += n;
+    return n;
+}
+static UINT jsx_out(JDEC *jd, void *bitmap, JRECT *rc) {
+    jsx_t *c = (jsx_t *)jd->device;
+    const uint8_t *in = (const uint8_t *)bitmap;   // red, green, blue, three bytes a pixel
+    for (int y = rc->top; y <= rc->bottom; y++) for (int x = rc->left; x <= rc->right; x++, in += 3) {
+        if (x >= c->ow || y >= c->oh) continue;
+        uint16_t v = (uint16_t)(((in[0] & 0xF8) << 8) | ((in[1] & 0xFC) << 3) | (in[2] >> 3));
+        c->out[(size_t)y * c->ow + x] = (uint16_t)((v >> 8) | (v << 8));
+    }
+    return 1;
+}
+// Decodes a baseline JPEG from the open file, or from memory when there is no file, shrunk by den (1, 2, 4 or 8).
+static bool jpeg_stream(FILE *f, const uint8_t *mem, size_t len, int den, uint16_t **px, int *ow, int *oh) {
+    uint8_t *work = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!work) return false;
+    jsx_t c = {.f = f, .mem = mem, .len = len};
+    if (f) rewind(f);
+    JDEC jd;
+    JRESULT r = jd_prepare(&jd, jsx_in, work, 4096, &c);
+    if (r != JDR_OK) { free(work); ESP_LOGW(TAG, "jpeg prepare error %d", (int)r); return false; }
+    int scale = den == 1 ? 0 : den == 2 ? 1 : den == 4 ? 2 : 3;
+    c.ow = (int)jd.width / den; c.oh = (int)jd.height / den;
+    if (c.ow < 1 || c.oh < 1) { free(work); return false; }
+    c.out = heap_caps_calloc((size_t)c.ow * c.oh, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!c.out) { free(work); ESP_LOGW(TAG, "jpeg %ux%u at 1/%d needs %u bytes, free block %u", (unsigned)jd.width, (unsigned)jd.height, den, (unsigned)((size_t)c.ow * c.oh * 2), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)); return false; }
+    r = jd_decomp(&jd, jsx_out, (BYTE)scale);
+    free(work);
+    if (r != JDR_OK) { free(c.out); ESP_LOGW(TAG, "jpeg decode error %d", (int)r); return false; }
+    *px = c.out; *ow = c.ow; *oh = c.oh;
+    return true;
+}
+
 static const int DENS[] = {1, 2, 4, 8, 16, 32};
 static bool decode_into(raster_t *r, int den) {
     if (r->px && r->den == den) return true;
     free(r->px); r->px = NULL;
     if (kind == K_JPEG) {
         if (den > 8) return fail("That picture is too large to show.");
-        esp_jpeg_image_cfg_t cfg = {.indata = src, .indata_size = src_len, .out_format = JPEG_IMAGE_FORMAT_RGB565,
-                                    .out_scale = den == 1 ? JPEG_IMAGE_SCALE_0 : den == 2 ? JPEG_IMAGE_SCALE_1_2 : den == 4 ? JPEG_IMAGE_SCALE_1_4 : JPEG_IMAGE_SCALE_1_8,
-                                    .flags = {.swap_color_bytes = 1}};
-        esp_jpeg_image_output_t info;
-        esp_err_t ie = esp_jpeg_get_image_info(&cfg, &info);
-        if (ie != ESP_OK) return fail("That JPEG could not be read.");
-        // the decoder reports the full size even when it is asked for a shrunk copy, so the size of the copy is worked out here
-        int cw = (info.width + den - 1) / den, ch = (info.height + den - 1) / den;
-        cfg.outbuf_size = (uint32_t)cw * ch * 2 + 64;
-        r->px = heap_caps_malloc(cfg.outbuf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!r->px) { ESP_LOGW(TAG, "jpeg %dx%d at 1/%d needs %u bytes, free block %u", fw, fh, den, (unsigned)cfg.outbuf_size, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)); return fail("Not enough memory for that picture."); }
-        cfg.outbuf = (uint8_t *)r->px;
-        esp_err_t de = esp_jpeg_decode(&cfg, &info);
-        if (de != ESP_OK) { free(r->px); r->px = NULL; ESP_LOGW(TAG, "jpeg decode error %s", esp_err_to_name(de)); return fail("That JPEG could not be decoded."); }
-        // the rows are as long as the decoder says now, it can differ by a pixel from a plain division
-        r->w = info.width > 0 && info.width <= cw ? info.width : (fw / den > 0 ? fw / den : cw); r->h = info.height > 0 && info.height <= ch ? info.height : (fh / den > 0 ? fh / den : ch); r->den = den;
-        ESP_LOGI(TAG, "jpeg at 1/%d: decoder says %dx%d, planned %dx%d", den, (int)info.width, (int)info.height, cw, ch);
+        int ow = 0, oh = 0;
+        if (!jpeg_stream(jfile, src, src_len, den, &r->px, &ow, &oh)) return fail(r->px ? "That JPEG could not be decoded." : "That JPEG could not be decoded, or it needs more memory than there is.");
+        r->w = ow; r->h = oh; r->den = den;
+        ESP_LOGI(TAG, "jpeg at 1/%d: %dx%d", den, ow, oh);
         return true;
     }
     png_t p;
@@ -413,6 +514,31 @@ static bool render(void) {
     int32_t step = (int32_t)(65536.0f * span);
     int32_t fx0 = (int32_t)(((cxF - viewW / 2) / r->den) * 65536.0f);
     int32_t fy0 = (int32_t)(((cyF - viewH / 2) / r->den) * 65536.0f);
+    if (orient != 1) {   // a photo that was held sideways or upside down: each screen pixel is looked up through the turn
+        float ox0 = cxF - viewW / 2, oy0 = cyF - viewH / 2, inv = 1.0f / z;
+        for (int y = 0; y < SH; y++) {
+            int oy = (int)(oy0 + y * inv);
+            if (oy < 0 || oy >= fh) continue;
+            uint16_t *o = screen + (size_t)y * SW;
+            for (int x = 0; x < SW; x++) {
+                int ox = (int)(ox0 + x * inv);
+                if (ox < 0 || ox >= fw) continue;
+                int rx, ry;
+                orient_map(orient, ox, oy, rawW, rawH, &rx, &ry);
+                rx /= r->den; ry /= r->den;
+                if (rx < 0 || rx >= r->w || ry < 0 || ry >= r->h) continue;
+                if (k == 1) { o[x] = r->px[(size_t)ry * r->w + rx]; continue; }
+                uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
+                for (int yy = 0; yy < k && ry + yy < r->h; yy++) for (int xx = 0; xx < k && rx + xx < r->w; xx++) {
+                    uint16_t p = r->px[(size_t)(ry + yy) * r->w + rx + xx];
+                    p = (uint16_t)((p >> 8) | (p << 8));
+                    sr += (p >> 11) & 31; sg += (p >> 5) & 63; sb += p & 31; cnt++;
+                }
+                uint16_t v = (uint16_t)(((sr / cnt) << 11) | ((sg / cnt) << 5) | (sb / cnt));
+                o[x] = (uint16_t)((v >> 8) | (v << 8));
+            }
+        }
+    } else
     for (int y = 0; y < SH; y++) {
         int32_t sy = (fy0 + y * step) >> 16;
         if (sy < 0 || sy >= r->h) continue;
@@ -439,6 +565,7 @@ static bool render(void) {
             }
         }
     }
+    if (heart_on) imgview_draw_heart(screen, SW, SH, SW - 9 * 3 - 14, 14, 3);
     display_raw(true);
     display_draw_pixels(0, 0, SW, SH, screen);
     free(screen);
@@ -463,23 +590,118 @@ static void pan(int dxs, int dys) {   // in screen pixels
 static bool piled_up(void) { return render_ms > 150 && esp_timer_get_time() - render_end_us < 400000; }
 
 // ---------- thumbnails ----------
+// Cuts the middle of a decoded picture, turned the way the camera was held, to fill tw by th. rw and rh are the stored size of the whole picture,
+// rr is a copy of it shrunk by rr.den.
+static uint16_t *cover_crop(const raster_t *rr, int rw, int rh, int o, int tw, int th) {
+    int dw = o >= 5 ? rh : rw, dh = o >= 5 ? rw : rh;   // the size as it is seen
+    uint16_t *out = heap_caps_malloc((size_t)tw * th * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!out) return NULL;
+    float cover = fmaxf((float)tw / dw, (float)th / dh);
+    float ww = tw / cover, hh = th / cover;              // the part that is kept, in picture pixels
+    float x0 = (dw - ww) / 2, y0 = (dh - hh) / 2;
+    for (int y = 0; y < th; y++) {
+        for (int x = 0; x < tw; x++) {
+            // the box of seen pixels under this thumbnail pixel, turned back to stored pixels
+            int ax = (int)(x0 + x / cover), ay = (int)(y0 + y / cover);
+            int bx = (int)(x0 + (x + 1) / cover), by = (int)(y0 + (y + 1) / cover);
+            if (bx <= ax) bx = ax + 1;
+            if (by <= ay) by = ay + 1;
+            int r0x, r0y, r1x, r1y;
+            orient_map(o, ax, ay, rw, rh, &r0x, &r0y);
+            orient_map(o, bx - 1, by - 1, rw, rh, &r1x, &r1y);
+            int lx = (r0x < r1x ? r0x : r1x) / rr->den, hx = (r0x < r1x ? r1x : r0x) / rr->den;
+            int ly = (r0y < r1y ? r0y : r1y) / rr->den, hy = (r0y < r1y ? r1y : r0y) / rr->den;
+            uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
+            for (int yy = ly; yy <= hy && yy < rr->h; yy++) for (int xx = lx; xx <= hx && xx < rr->w; xx++) {
+                uint16_t p = rr->px[(size_t)yy * rr->w + xx];
+                p = (uint16_t)((p >> 8) | (p << 8));
+                sr += (p >> 11) & 31; sg += (p >> 5) & 63; sb += p & 31; cnt++;
+            }
+            uint16_t v = cnt ? (uint16_t)(((sr / cnt) << 11) | ((sg / cnt) << 5) | (sb / cnt)) : 0;
+            out[(size_t)y * tw + x] = (uint16_t)((v >> 8) | (v << 8));
+        }
+    }
+    return out;
+}
+
 uint16_t *imgview_thumb(const char *path, int tw, int th) {
     if (is_open) return NULL;
     free_all();
     struct stat st;
-    if (stat(path, &st) != 0 || st.st_size <= 0 || st.st_size > MAX_FILE) return NULL;
+    if (stat(path, &st) != 0 || st.st_size <= 0) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    // the first part of the file is enough for a camera JPEG: it has a small preview of its own and says which way it was held
+    size_t headn = (size_t)st.st_size < 131072 ? (size_t)st.st_size : 131072;
+    uint8_t *head = heap_caps_malloc(headn, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!head || fread(head, 1, headn, f) != headn) { free(head); fclose(f); return NULL; }
+    int o = 1;
+    size_t toff = 0, tlen = 0;
+    bool is_jpg = headn > 8 && head[0] == 0xFF && head[1] == 0xD8;
+    if (is_jpg) exif_scan(head, headn, &o, &toff, &tlen);
+    uint16_t *out = NULL;
+    if (is_jpg && toff && tlen && toff + tlen <= headn) {   // the quick way
+        esp_jpeg_image_cfg_t cfg = {.indata = head + toff, .indata_size = (uint32_t)tlen, .out_format = JPEG_IMAGE_FORMAT_RGB565, .out_scale = JPEG_IMAGE_SCALE_0, .flags = {.swap_color_bytes = 1}};
+        esp_jpeg_image_output_t info;
+        if (esp_jpeg_get_image_info(&cfg, &info) == ESP_OK && info.width > 0 && info.height > 0 && info.width <= 1024 && info.height <= 1024) {
+            raster_t t = {0};
+            t.px = heap_caps_malloc((size_t)info.width * info.height * 2 + 64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (t.px) {
+                cfg.outbuf = (uint8_t *)t.px; cfg.outbuf_size = (uint32_t)info.width * info.height * 2 + 64;
+                int rw = info.width, rh = info.height;
+                if (esp_jpeg_decode(&cfg, &info) == ESP_OK) {
+                    t.w = rw; t.h = rh; t.den = 1;
+                    // the preview is stored in the same turn as the picture
+                    out = cover_crop(&t, rw, rh, o, tw, th);
+                }
+                free(t.px);
+            }
+        }
+    }
+    bool hprog = false;
+    int hw = 0, hh = 0;
+    if (is_jpg) for (size_t i = 2; i + 9 < headn;) {   // the size, and whether it is progressive
+        if (head[i] != 0xFF) { i++; continue; }
+        uint8_t m = head[i + 1];
+        if (m == 0xFF) { i++; continue; }
+        if (m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01) { i += 2; continue; }
+        size_t sl = ((size_t)head[i + 2] << 8) | head[i + 3];
+        if (m == 0xC2 || m == 0xC6 || m == 0xCA) hprog = true;
+        if (m == 0xC0 || m == 0xC1 || m == 0xC2) { hh = (head[i + 5] << 8) | head[i + 6]; hw = (head[i + 7] << 8) | head[i + 8]; break; }
+        i += 2 + sl;
+    }
+    free(head);
+    if (out) { fclose(f); return out; }
+    if (is_jpg && !hprog && hw > 0 && hh > 0) {   // no preview in it: a plain JPEG is decoded small from the card, whatever its size
+        setvbuf(f, NULL, _IOFBF, 16384);
+        int dw = o >= 5 ? hh : hw, dh = o >= 5 ? hw : hh;
+        float cover = fmaxf((float)tw / dw, (float)th / dh);
+        int den = 1;
+        for (int i = 0; i < 4; i++) if (cover * DENS[i] <= 1.0f) den = DENS[i];
+        uint16_t *px = NULL;
+        int ow = 0, oh = 0;
+        if (jpeg_stream(f, NULL, 0, den, &px, &ow, &oh)) {
+            raster_t rr = {.px = px, .w = ow, .h = oh, .den = den};
+            out = cover_crop(&rr, hw, hh, o, tw, th);
+            free(px);
+        }
+        fclose(f);
+        return out;
+    }
+    // a progressive JPEG, PNG, BMP or GIF: the whole file is decoded small
+    fclose(f);
+    if (st.st_size > MAX_FILE) return NULL;
     src = heap_caps_malloc((size_t)st.st_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!src) return NULL;
-    FILE *f = fopen(path, "rb");
+    f = fopen(path, "rb");
     bool ok = f && fread(src, 1, (size_t)st.st_size, f) == (size_t)st.st_size;
     if (f) fclose(f);
     if (!ok) { free_all(); return NULL; }
     src_len = (uint32_t)st.st_size;
-    uint16_t *out = NULL;
     raster_t rr = {0};
     bool general = false, progressive = false;
     fw = fh = 0;
-    if (src_len > 8 && ((src[0] == 'B' && src[1] == 'M') || !memcmp(src, "GIF8", 4))) general = true;
+    if (src_len > 8 && ((src[0] == 'B' && src[1] == 'M') || !memcmp(src, "GIF8", 4))) { general = true; o = 1; }
     else if (src_len > 8 && src[0] == 0xFF && src[1] == 0xD8) {
         kind = K_JPEG;
         for (uint32_t i = 2; i + 9 < src_len;) {
@@ -494,6 +716,7 @@ uint16_t *imgview_thumb(const char *path, int tw, int th) {
         }
         if (fw < 1 || fh < 1) { free_all(); return NULL; }
     } else {
+        o = 1;
         png_t p;
         if (!png_header(src, src_len, &p) || p.interlace) { free_all(); return NULL; }
         if (p.depth != 1 && p.depth != 2 && p.depth != 4 && p.depth != 8 && p.depth != 16) { free_all(); return NULL; }
@@ -510,48 +733,56 @@ uint16_t *imgview_thumb(const char *path, int tw, int th) {
         if (!rr.px) { free_all(); return NULL; }
         rr.w = ow; rr.h = oh; rr.den = 8; fw = w; fh = h;
     } else {
-        float cover = fmaxf((float)tw / fw, (float)th / fh);
+        int dw = o >= 5 ? fh : fw, dh = o >= 5 ? fw : fh;
+        float cover = fmaxf((float)tw / dw, (float)th / dh);
         int den = 1;
         for (int i = 0; i < 6; i++) if (cover * DENS[i] <= 1.0f && !(kind == K_JPEG && DENS[i] > 8)) den = DENS[i];
         if (!decode_into(&rr, den)) { free_all(); return NULL; }
     }
-    // the middle of the picture, scaled to fill the thumbnail, boxes of source pixels averaged
-    out = heap_caps_malloc((size_t)tw * th * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (out) {
-        float cover = fmaxf((float)tw / fw, (float)th / fh);
-        float ww = tw / cover, hh = th / cover;          // the part of the picture that is kept, in picture pixels
-        float x0 = (fw - ww) / 2, y0 = (fh - hh) / 2;
-        for (int y = 0; y < th; y++) {
-            int ry0 = (int)((y0 + y / cover) / rr.den), ry1 = (int)((y0 + (y + 1) / cover) / rr.den);
-            if (ry1 <= ry0) ry1 = ry0 + 1;
-            for (int x = 0; x < tw; x++) {
-                int rx0 = (int)((x0 + x / cover) / rr.den), rx1 = (int)((x0 + (x + 1) / cover) / rr.den);
-                if (rx1 <= rx0) rx1 = rx0 + 1;
-                uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
-                for (int yy = ry0; yy < ry1 && yy < rr.h; yy++) for (int xx = rx0; xx < rx1 && xx < rr.w; xx++) {
-                    uint16_t p = rr.px[(size_t)yy * rr.w + xx];
-                    p = (uint16_t)((p >> 8) | (p << 8));
-                    sr += (p >> 11) & 31; sg += (p >> 5) & 63; sb += p & 31; cnt++;
-                }
-                uint16_t v = cnt ? (uint16_t)(((sr / cnt) << 11) | ((sg / cnt) << 5) | (sb / cnt)) : 0;
-                out[(size_t)y * tw + x] = (uint16_t)((v >> 8) | (v << 8));
-            }
-        }
-    }
+    out = cover_crop(&rr, fw, fh, o, tw, th);
     free(rr.px);
     free_all();
     return out;
 }
 
 // ---------- the public side ----------
+void imgview_set_heart(bool on) { heart_on = on; if (is_open) render(); }
 void imgview_close(void) { free_all(); display_raw(false); is_open = false; }
 bool imgview_active(void) { return is_open; }
+
+// The last part of opening: the zoom steps, the first picture on screen, and a second try with the general decoder when the quick one cannot read it.
+static bool finish_open(size_t budget) {
+    apply_orient();
+    build_steps(budget);
+    cx = cy = 0.5f;
+    if (!render()) {
+        if (kind == K_JPEG && !src && jfile) {   // read from the card so far: for the second try it has to be in memory
+            fseek(jfile, 0, SEEK_END);
+            long n = ftell(jfile);
+            rewind(jfile);
+            if (n > 0 && n <= MAX_FILE && (src = heap_caps_malloc((size_t)n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)) != NULL) {
+                if (fread(src, 1, (size_t)n, jfile) == (size_t)n) src_len = (uint32_t)n; else { free(src); src = NULL; }
+            }
+            fclose(jfile); jfile = NULL;
+        }
+        if (kind == K_JPEG && src) {   // the quick decoder could not do this one, the general one is tried
+            free_rasters();
+            if (open_general(budget, false)) { apply_orient(); build_steps(budget); cx = cy = 0.5f; if (render()) { is_open = true; return true; } }
+        }
+        free_all(); display_raw(false);
+        return false;
+    }
+    is_open = true;
+    return true;
+}
 
 bool imgview_open(uint8_t *data, uint32_t len) {
     free_all();
     err_text[0] = 0;
     is_open = false;
     src = data; src_len = len;
+    orient = 1; heart_on = false;
+    if (len > 8 && data[0] == 0xFF && data[1] == 0xD8) { size_t to, tl; exif_scan(data, len < 262144 ? len : 262144, &orient, &to, &tl); }
     bool progressive = false;
     size_t freeb = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     size_t budget = freeb > 1500000 ? freeb - 1500000 : 0;   // room is kept for the screen copy and the decoder
@@ -587,27 +818,55 @@ bool imgview_open(uint8_t *data, uint32_t len) {
         kind = K_PNG; fw = (int)p.w; fh = (int)p.h;
         ESP_LOGI(TAG, "PNG %dx%d, file %u bytes, free block %u, budget %u", fw, fh, (unsigned)len, (unsigned)freeb, (unsigned)budget);
     }
-    build_steps(budget);
-    cx = cy = 0.5f;
-    if (!render()) {
-        if (kind == K_JPEG && src) {   // the quick decoder could not do this one, the general one is tried
-            free_rasters();
-            if (open_general(budget, false)) { build_steps(budget); cx = cy = 0.5f; if (render()) { is_open = true; return true; } }
-        }
-        free_all(); display_raw(false);
-        return false;
-    }
-    is_open = true;
-    return true;
+    return finish_open(budget);
 }
 
 bool imgview_file(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0 || st.st_size <= 0) { fail("That file could not be found."); return false; }
-    if (st.st_size > MAX_FILE) { fail("That picture file is over 6 MB."); return false; }
+    FILE *f = fopen(path, "rb");
+    if (!f) { fail("That file could not be read."); return false; }
+    // a baseline JPEG is decoded from the card as it is read, so it can be as big as the camera makes it
+    uint8_t *head = heap_caps_malloc(131072, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t hn = head ? fread(head, 1, 131072, f) : 0;
+    if (hn > 8 && head[0] == 0xFF && head[1] == 0xD8) {
+        bool prog = false;
+        int w = 0, h = 0;
+        for (size_t i = 2; i + 9 < hn;) {
+            if (head[i] != 0xFF) { i++; continue; }
+            uint8_t m = head[i + 1];
+            if (m == 0xFF) { i++; continue; }
+            if (m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01) { i += 2; continue; }
+            size_t sl = ((size_t)head[i + 2] << 8) | head[i + 3];
+            if (m == 0xC2 || m == 0xC6 || m == 0xCA) prog = true;
+            if (m == 0xC0 || m == 0xC1 || m == 0xC2) { h = (head[i + 5] << 8) | head[i + 6]; w = (head[i + 7] << 8) | head[i + 8]; break; }
+            i += 2 + sl;
+        }
+        if (!prog && w > 0 && h > 0) {
+            free_all();
+            err_text[0] = 0;
+            is_open = false;
+            orient = 1; heart_on = false;
+            size_t to, tl;
+            exif_scan(head, hn, &orient, &to, &tl);
+            free(head);
+            setvbuf(f, NULL, _IOFBF, 16384);
+            jfile = f; kind = K_JPEG; fw = w; fh = h;
+            size_t freeb = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+            size_t budget = freeb > 1500000 ? freeb - 1500000 : 0;
+            if (budget > 6 * 1024 * 1024) budget = 6 * 1024 * 1024;
+            ESP_LOGI(TAG, "JPEG %dx%d from the card, file %ld bytes, free block %u, budget %u", w, h, (long)st.st_size, (unsigned)freeb, (unsigned)budget);
+            label_low = false;
+            label("Loading...");
+            return finish_open(budget);
+        }
+    }
+    free(head);
+    fclose(f);
+    if (st.st_size > MAX_FILE) { fail("That picture file is over 6 MB, and only plain JPEG files can be bigger."); return false; }
     uint8_t *d = heap_caps_malloc((size_t)st.st_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!d) { fail("Not enough memory for that picture."); return false; }
-    FILE *f = fopen(path, "rb");
+    f = fopen(path, "rb");
     bool ok = f && fread(d, 1, (size_t)st.st_size, f) == (size_t)st.st_size;
     if (f) fclose(f);
     if (!ok) { free(d); fail("That file could not be read."); return false; }
@@ -616,6 +875,7 @@ bool imgview_file(const char *path) {
 
 iv_action_t imgview_key(uint16_t code) {
     bool close_key = !(code == HID_ENTER || code == HID_EQUALS || code == HID_MINUS || code == HID_RIGHT || code == HID_LEFT || code == HID_UP || code == HID_DOWN || code == HID_SPACE);
+    if (code == HID_SPACE) return IV_HEART;   // Space hearts the picture, the caller keeps the list of favorites
     if (!close_key && piled_up()) return IV_NONE;
     label_low = true;
     if (code == HID_ENTER) zoom_to((zi + 1) % nz, -1, -1);                         // each Enter zooms in one step, after the last it shows the whole picture again
@@ -623,7 +883,7 @@ iv_action_t imgview_key(uint16_t code) {
     else if (code == HID_MINUS) zoom_to(zi - 1, -1, -1);                           // minus: one step out
     else if (zi > 0 && (code == HID_RIGHT || code == HID_LEFT || code == HID_UP || code == HID_DOWN))   // zoomed in: the arrows move the view
         pan(code == HID_RIGHT ? SW / 3 : code == HID_LEFT ? -SW / 3 : 0, code == HID_DOWN ? SH / 3 : code == HID_UP ? -SH / 3 : 0);
-    else if (code == HID_RIGHT || code == HID_DOWN || code == HID_SPACE) return IV_NEXT;   // the whole picture is showing: the next picture
+    else if (code == HID_RIGHT || code == HID_DOWN) return IV_NEXT;   // the whole picture is showing: the next picture
     else if (code == HID_LEFT || code == HID_UP) return IV_PREV;
     else return IV_CLOSE;
     return IV_NONE;

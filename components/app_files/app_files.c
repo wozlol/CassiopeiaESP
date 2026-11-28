@@ -47,7 +47,7 @@ static int cols, rows, font_idx, theme_idx, bright_idx;
 static bool shift, ctrl, alt, gui, gui_tap;
 static app_exit_t quit_app;
 
-typedef struct { char name[64]; bool dir; long size; } ent_t;
+typedef struct { char name[64]; bool dir; bool heart; long size; } ent_t;   // heart: it is in the folder's hearts.txt
 static ent_t *ents;
 static int nents, bsel, btop;
 static char cwd[256] = ROOT;
@@ -160,6 +160,42 @@ static int ent_cmp(const void *a, const void *b) {
     if (x->dir != y->dir) return x->dir ? -1 : 1;
     return strcasecmp(x->name, y->name);
 }
+// ---------- favorites: hearts.txt in the folder lists the pictures that were hearted, one name a line, easy to read on a computer ----------
+static void hearts_load(const char *dir) {
+    char p[400];
+    snprintf(p, sizeof p, "%.255s/hearts.txt", dir);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    char line[160];
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        for (int i = 0; i < nents; i++) if (!ents[i].dir && !strcmp(ents[i].name, line)) { ents[i].heart = true; break; }
+    }
+    fclose(f);
+}
+// Adds the picture to hearts.txt, or takes it out if it is there. The rest of the file is kept as it is.
+static void hearts_toggle(int idx) {
+    char p[400];
+    snprintf(p, sizeof p, "%.255s/hearts.txt", cwd);
+    char *text = heap_caps_calloc(1, 40000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT), *out = heap_caps_calloc(1, 40000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!text || !out) { free(text); free(out); return; }
+    FILE *f = fopen(p, "r");
+    size_t n = 0;
+    if (f) { n = fread(text, 1, 39000, f); fclose(f); }
+    text[n] = 0;
+    bool had = false;
+    size_t on = 0;
+    for (char *line = strtok(text, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+        if (!strcmp(line, ents[idx].name)) { had = true; continue; }
+        on += (size_t)snprintf(out + on, 39900 - on, "%s\n", line);
+    }
+    if (!had) on += (size_t)snprintf(out + on, 39900 - on, "%s\n", ents[idx].name);
+    if (on == 0) remove(p);
+    else { FILE *g = fopen(p, "w"); if (g) { fwrite(out, 1, on, g); fclose(g); } }
+    ents[idx].heart = !had;
+    free(text); free(out);
+}
 static void browse(const char *dir) {
     if (!ents) ents = heap_caps_calloc(MAX_ENT, sizeof(ent_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     snprintf(cwd, sizeof cwd, "%s", dir);
@@ -174,12 +210,14 @@ static void browse(const char *dir) {
         struct stat st;
         if (stat(p, &st) != 0) continue;
         ent_t *x = &ents[nents++];
+        memset(x, 0, sizeof *x);   // a slot used before must not keep its old heart
         snprintf(x->name, sizeof x->name, "%.63s", e->d_name);
         x->dir = S_ISDIR(st.st_mode);
         x->size = x->dir ? 0 : (long)st.st_size;
     }
     closedir(d);
     qsort(ents, nents, sizeof(ent_t), ent_cmp);
+    hearts_load(dir);
 }
 static bool is_jpeg(const char *n) {   // a picture the viewer can try: JPEG, PNG, BMP or GIF
     const char *e = strrchr(n, '.');
@@ -200,7 +238,9 @@ static bool show_picture(int idx) {
     free(tscreen); tscreen = NULL;   // the thumbnail frame is not needed while a picture is open
     char p[400];
     snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[idx].name);
-    return imgview_file(p);
+    bool ok = imgview_file(p);
+    if (ok && ents[idx].heart) imgview_set_heart(true);
+    return ok;
 }
 static int next_picture(int from, int dir) {
     for (int i = from + dir; i >= 0 && i < nents; i += dir) if (!ents[i].dir && is_jpeg(ents[i].name)) return i;
@@ -270,6 +310,7 @@ static void thumbs_draw(void) {
             if (tthumb[i]) { if (y - 2 < TIH) memcpy(dst, tthumb[i] + (size_t)(y - 2) * TIW, TIW * 2); }
             else for (int x = 0; x < TIW; x++) dst[x] = tfail[i] ? 0x0000 : 0x0821;   // dark gray while it waits, black when it could not be made
         }
+        if (ents[tpics[i]].heart) imgview_draw_heart(tscreen, 480, 320, cx + TCW - 9 * 2 - 8, cy + 8, 2);
         if (i == tsel) {   // a white frame around the selected one
             for (int x = 0; x < TCW; x++) for (int t = 0; t < 2; t++) {
                 int yt = cy + t, yb = cy + TCH - 1 - t;
@@ -505,6 +546,7 @@ static void handle_key(a11_event_t ev) {
         case ST_PICTURE: {
             iv_action_t act = imgview_key(code);
             if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; bsel = n; if (!show_picture(n)) { leave_picture(); msg_show("%s", imgview_error()); } } }
+            else if (act == IV_HEART) { hearts_toggle(pic_idx); imgview_set_heart(ents[pic_idx].heart); }
             else if (act == IV_CLOSE) { leave_picture(); from_thumbs = from_thumbs && state == ST_THUMBS; }
             break;
         }
