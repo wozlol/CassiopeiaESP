@@ -16,6 +16,7 @@
 #include "miniz.h"
 #include "rom/tjpgd.h"
 #include "jpeg_dc.h"
+#include "jpeg_fast.h"
 #include "stb_image.h"
 
 static const char *TAG = "imgview";
@@ -169,9 +170,10 @@ static void progress(int pct) {
 }
 
 // ---------- the picture and what is decoded from it ----------
-typedef enum { K_JPEG, K_PNG, K_RAW } kind_t;   // K_RAW: already decoded in full by the general decoder
-typedef struct { uint16_t *px; int w, h, den; } raster_t;
+typedef enum { K_JPEG, K_PNG, K_RAW, K_JFAST } kind_t;   // K_RAW: already decoded in full by the general decoder. K_JFAST: a big baseline JPEG decoded by part from the card
+typedef struct { uint16_t *px; int w, h, den; int x0, y0; } raster_t;   // x0 and y0: where a decoded part starts in the stored picture, in stored pixels
 static uint8_t *src; static uint32_t src_len; static kind_t kind;
+static jf_t *jfast;   // the part by part decoder
 static FILE *jfile;   // a baseline JPEG that is read from the card as it is decoded, so a big camera file never has to be held whole
 static int fw, fh;                          // the whole picture
 static raster_t R[2];                       // [0] a small copy for the whole picture view, [1] the finest copy that fits in memory
@@ -185,7 +187,7 @@ static bool is_open;
 static int64_t render_end_us, render_ms;    // keys that piled up during a slow load are ignored for a moment after it
 
 static void free_rasters(void) { for (int i = 0; i < 2; i++) { free(R[i].px); R[i].px = NULL; R[i].w = R[i].h = R[i].den = 0; } }
-static void free_all(void) { free_rasters(); free(src); src = NULL; src_len = 0; if (jfile) { fclose(jfile); jfile = NULL; } }
+static void free_all(void) { free_rasters(); free(src); src = NULL; src_len = 0; if (jfast) { jf_close(jfast); jfast = NULL; } if (jfile) { fclose(jfile); jfile = NULL; } }
 
 // ---------- PNG ----------
 static void progress(int pct);
@@ -455,6 +457,7 @@ static int den_ideal(float z) {   // the biggest shrink that still has a decoded
 static void build_steps(size_t budget) {
     den_min = 32;   // the smallest shrink whose decoded copy fits in memory
     if (kind == K_RAW) { den_min = raw_den; }
+    else if (kind == K_JFAST) { den_min = 1; }   // a part is decoded at full size when it is needed
     else for (int i = 0; i < 6; i++) {
         size_t bytes = (size_t)((fw + DENS[i] - 1) / DENS[i]) * (size_t)((fh + DENS[i] - 1) / DENS[i]) * 2;
         if (bytes <= budget) { den_min = DENS[i]; break; }
@@ -478,8 +481,61 @@ static void build_steps(size_t budget) {
 }
 
 // The decoded copy to draw the zoom z from, decoded now if it is not there yet.
-static raster_t *copy_for(float z) {
+static raster_t *copy_for(float z, float vx, float vy, float vw, float vh) {
     if (kind == K_RAW) return &R[1];
+    if (kind == K_JFAST) {   // vx, vy, vw, vh: the part of the picture on screen, as it is seen
+        int dt = den_ideal(z);
+        if (dt >= 8) {   // the small copy of the whole picture, decoded from block averages alone
+            raster_t *r = &R[0];
+            if (!r->px) {
+                label_low = is_open; label("Loading...");
+                int rw = (rawW / 8) * 8, rh = (rawH / 8) * 8;
+                r->px = heap_caps_malloc((size_t)(rw / 8) * (rh / 8) * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                int64_t td = esp_timer_get_time();
+                bool okd = r->px && jf_region(jfast, 8, 0, 0, rw, rh, r->px);
+                ESP_LOGI(TAG, "whole picture at 1/8 decoded in %lld ms", (long long)((esp_timer_get_time() - td) / 1000));
+                if (!okd) { free(r->px); r->px = NULL; fail("That JPEG could not be decoded."); return NULL; }
+                r->w = rw / 8; r->h = rh / 8; r->den = 8; r->x0 = r->y0 = 0;
+            }
+            return r;
+        }
+        if (dt < 1) dt = 1;
+        // the part wanted, in stored pixels: the view's corners turned back, with room around it so that moving a little needs no new decode
+        int ax, ay, bx, by;
+        orient_map(orient, (int)vx < 0 ? 0 : (int)vx, (int)vy < 0 ? 0 : (int)vy, rawW, rawH, &ax, &ay);
+        int ex = (int)(vx + vw) - 1, ey = (int)(vy + vh) - 1;
+        if (ex >= fw) ex = fw - 1;
+        if (ey >= fh) ey = fh - 1;
+        orient_map(orient, ex, ey, rawW, rawH, &bx, &by);
+        int lx = ax < bx ? ax : bx, hx = ax < bx ? bx : ax, ly = ay < by ? ay : by, hy = ay < by ? by : ay;
+        raster_t *r = &R[1];
+        bool have = r->px && r->den == dt && lx >= r->x0 && ly >= r->y0 && hx < r->x0 + r->w * dt && hy < r->y0 + r->h * dt;
+        if (have) return r;
+        int mx = (int)(fmaxf(vw, vh) * 0.6f);   // room around
+        long area_cap = 1500000L * dt * dt;     // at most about 1.5 million decoded pixels
+        for (;;) {
+            long wx = (long)(hx - lx + 1) + 2L * mx, wy = (long)(hy - ly + 1) + 2L * mx;
+            if (wx * wy <= area_cap || mx == 0) break;
+            mx /= 2;
+        }
+        int x0 = (lx - mx) & ~15, y0 = (ly - mx) & ~15;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        int x1 = (hx + mx + 16) & ~15, y1 = (hy + mx + 16) & ~15;
+        if (x1 > rawW) x1 = rawW;
+        if (y1 > rawH) y1 = rawH;
+        int ww = ((x1 - x0) / dt) * dt, hh = ((y1 - y0) / dt) * dt;
+        if (ww < dt || hh < dt) return NULL;
+        free(r->px); r->px = NULL;
+        label_low = is_open; label("Loading...");
+        r->px = heap_caps_malloc((size_t)(ww / dt) * (hh / dt) * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        int64_t td = esp_timer_get_time();
+        bool okd = r->px && jf_region(jfast, dt, x0, y0, ww, hh, r->px);
+        ESP_LOGI(TAG, "part %dx%d at 1/%d decoded in %lld ms", ww, hh, dt, (long long)((esp_timer_get_time() - td) / 1000));
+        if (!okd) { free(r->px); r->px = NULL; fail("Not enough memory for that part of the picture."); return NULL; }
+        r->w = ww / dt; r->h = hh / dt; r->den = dt; r->x0 = x0; r->y0 = y0;
+        return r;
+    }
     int dt = den_ideal(z);
     if (dt < den_min) dt = den_min;
     raster_t *r = (den_over != den_min && dt >= den_over) ? &R[0] : &R[1];
@@ -498,22 +554,23 @@ static bool render(void) {
         int dt = den_ideal(z); if (dt < den_min) dt = den_min;
         bool over = kind != K_RAW && den_over != den_min && dt >= den_over;
         raster_t *want = over ? &R[0] : &R[1];
-        if (kind != K_RAW && !want->px) { label_low = is_open; label(kind == K_PNG ? "Loading 0%" : "Loading..."); }
+        if (kind != K_RAW && kind != K_JFAST && !want->px) { label_low = is_open; label(kind == K_PNG ? "Loading 0%" : "Loading..."); }
     }
-    r = copy_for(z);
-    if (!r) return false;
     float viewW = SW / z, viewH = SH / z;   // how much of the picture the screen shows, in picture pixels
     float cxF = cx * fw, cyF = cy * fh;
     if (viewW >= fw) cxF = fw / 2.0f; else { if (cxF < viewW / 2) cxF = viewW / 2; if (cxF > fw - viewW / 2) cxF = fw - viewW / 2; }
     if (viewH >= fh) cyF = fh / 2.0f; else { if (cyF < viewH / 2) cyF = viewH / 2; if (cyF > fh - viewH / 2) cyF = fh - viewH / 2; }
     cx = cxF / fw; cy = cyF / fh;
+    r = copy_for(z, cxF - viewW / 2, cyF - viewH / 2, viewW, viewH);
+    if (!r) return false;
+    int rxo = r->x0 / r->den, ryo = r->y0 / r->den;   // where the decoded part starts, in its own pixels
     uint16_t *screen = heap_caps_calloc((size_t)SW * SH, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!screen) return fail("Not enough memory for that picture.");
     float span = 1.0f / (z * r->den);                                // decoded pixels under one screen pixel
     int k = span > 1.02f ? (int)ceilf(span) : 1;                    // more than one: they are averaged
     int32_t step = (int32_t)(65536.0f * span);
-    int32_t fx0 = (int32_t)(((cxF - viewW / 2) / r->den) * 65536.0f);
-    int32_t fy0 = (int32_t)(((cyF - viewH / 2) / r->den) * 65536.0f);
+    int32_t fx0 = (int32_t)(((cxF - viewW / 2) / r->den - rxo) * 65536.0f);
+    int32_t fy0 = (int32_t)(((cyF - viewH / 2) / r->den - ryo) * 65536.0f);
     if (orient != 1) {   // a photo that was held sideways or upside down: each screen pixel is looked up through the turn
         float ox0 = cxF - viewW / 2, oy0 = cyF - viewH / 2, inv = 1.0f / z;
         for (int y = 0; y < SH; y++) {
@@ -525,7 +582,7 @@ static bool render(void) {
                 if (ox < 0 || ox >= fw) continue;
                 int rx, ry;
                 orient_map(orient, ox, oy, rawW, rawH, &rx, &ry);
-                rx /= r->den; ry /= r->den;
+                rx = rx / r->den - rxo; ry = ry / r->den - ryo;
                 if (rx < 0 || rx >= r->w || ry < 0 || ry >= r->h) continue;
                 if (k == 1) { o[x] = r->px[(size_t)ry * r->w + rx]; continue; }
                 uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
@@ -680,7 +737,18 @@ uint16_t *imgview_thumb(const char *path, int tw, int th) {
         for (int i = 0; i < 4; i++) if (cover * DENS[i] <= 1.0f) den = DENS[i];
         uint16_t *px = NULL;
         int ow = 0, oh = 0;
-        if (jpeg_stream(f, NULL, 0, den, &px, &ow, &oh)) {
+        int jw = 0, jh = 0;
+        jf_t *jt = jf_open(f, &jw, &jh);   // the part by part decoder: a thumbnail needs only block averages, it is several times quicker than the plain one
+        if (jt && jw == hw && jh == hh) {
+            int dn = 8;
+            while (dn > 1 && cover * dn > 1.0f) dn /= 2;
+            int rw = (jw / dn) * dn, rh = (jh / dn) * dn;
+            px = heap_caps_malloc((size_t)(rw / dn) * (rh / dn) * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (px && jf_region(jt, dn, 0, 0, rw, rh, px)) { ow = rw / dn; oh = rh / dn; den = dn; } else { free(px); px = NULL; }
+        }
+        if (jt) jf_close(jt);
+        if (!px) { setvbuf(f, NULL, _IOFBF, 16384); rewind(f); }
+        if (px || jpeg_stream(f, NULL, 0, den, &px, &ow, &oh)) {
             raster_t rr = {.px = px, .w = ow, .h = oh, .den = den};
             out = cover_crop(&rr, hw, hh, o, tw, th);
             free(px);
@@ -756,6 +824,12 @@ static bool finish_open(size_t budget) {
     build_steps(budget);
     cx = cy = 0.5f;
     if (!render()) {
+        if (kind == K_JFAST) {   // the part by part decoder could not do this one: the plain one is tried
+            jf_close(jfast); jfast = NULL; free_rasters();
+            kind = K_JPEG; fw = rawW; fh = rawH;
+            apply_orient(); build_steps(budget); cx = cy = 0.5f;
+            if (render()) { is_open = true; return true; }
+        }
         if (kind == K_JPEG && !src && jfile) {   // read from the card so far: for the second try it has to be in memory
             fseek(jfile, 0, SEEK_END);
             long n = ftell(jfile);
@@ -852,6 +926,12 @@ bool imgview_file(const char *path) {
             free(head);
             setvbuf(f, NULL, _IOFBF, 16384);
             jfile = f; kind = K_JPEG; fw = w; fh = h;
+            if ((long)w * h > 2000000L) {   // a big picture is decoded by part, only what is on screen is turned into pixels
+                int jw = 0, jh = 0;
+                jfast = jf_open(f, &jw, &jh);
+                if (jfast && jw == w && jh == h) kind = K_JFAST;
+                else { if (jfast) { jf_close(jfast); jfast = NULL; } rewind(f); }
+            }
             size_t freeb = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
             size_t budget = freeb > 1500000 ? freeb - 1500000 : 0;
             if (budget > 6 * 1024 * 1024) budget = 6 * 1024 * 1024;
