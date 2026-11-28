@@ -2,7 +2,7 @@ CassiopeiaESP firmware, TEST BUILD.
 
 What this is: the loader and two programs for the ESP32-S3 board in the Casio A-11 handheld, with the bootloader and the partition table. Mode 1 is the terminal with the web admin page, the Library is the reader, media viewer and file manager.
 Source commit: 62a4752. mode1.bin and library.bin were built from that source. loader.bin, bootloader.bin and partition-table.bin are unchanged from the earlier build a363d23.
-Tested: NOT fully tested on hardware. Seen working: Mode 1 starts, the web page answers over the home Wi-Fi by its number and takes uploads to the SD card with no code. Built but not yet seen working: the Library program, the Files screens, casio.local, installing a program from the web page, the Tailscale name, the Ask for a code switch, the restart between Mode 1 and the Library. Treat them as test builds.
+Tested: NOT fully tested on hardware. Seen working: Mode 1 starts, the web page answers over the home Wi-Fi by its number and takes uploads to the SD card with no code. Built but not yet seen working: the Library program, the Files screens, wozlol.local, installing a program from the web page, the Tailscale name, the Ask for a code switch, the restart between Mode 1 and the Library. Treat them as test builds.
 
 How to flash, from this folder, with the USB cable plugged in. Find your port first, on a Mac it looks like /dev/cu.usbmodem1101.
 

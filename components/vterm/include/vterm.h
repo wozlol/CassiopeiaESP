@@ -52,6 +52,8 @@ void vterm_flush(void);
  * so the cursor returns without waiting for input.
  */
 void vterm_cursor_refresh(void);
+// While held, the terminal stops pushing its cursor to the display, so a menu drawn over it keeps its own cursor state. Releasing puts the true cursor back.
+void vterm_hold_cursor(bool hold);
 
 /** The terminal cell buffer (terminal_cell_t array, cols * rows), NULL before vterm_init(). */
 const void *vterm_buffer(void);

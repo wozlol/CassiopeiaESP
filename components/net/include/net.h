@@ -21,6 +21,7 @@ void net_connect(const char *ssid, const char *password, bool save);
 void net_disconnect(void);   // stops trying and drops the link
 void net_forget(void);       // deletes the saved network
 net_state_t net_state(void);
+int net_signal_percent(void);   // 0 to 100 from the signal strength, -1 when not connected
 const char *net_ip(void);    // "" when not connected
 const char *net_ssid(void);  // current or saved network name
 bool net_has_saved(void);

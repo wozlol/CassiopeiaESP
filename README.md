@@ -234,7 +234,7 @@ Adding a pack to the library:
 a11helper sync-do putdir ~/a11-staging/packs/honda-fit-2015-manual library/honda-fit-2015-manual
 ```
 
-Over Wi-Fi this is slow for big packs. The first fill of a card with tens of gigabytes belongs in a card reader. Sync mode is for updates, new manuals, one mode at a time, the clipboard, and anything you want to do without opening the Casio.
+Over Wi-Fi this is slow for big packs. The first fill of a card with tens of gigabytes belongs in a card reader. Sync mode is for updates, new manuals, one mode at a time, the clipboard, and anything you want to do without opening the handheld.
 
 Away from home it is the same: with Tailscale joined and the away address set, the handheld connects out through the tunnel, and the same commands work on the computer. The Status screen shows which route was used.
 
@@ -265,12 +265,12 @@ In the admin page open Access controls, then JSON editor. Replace everything wit
 ```
 {
     "tagOwners": {
-        "tag:casio": ["autogroup:admin"],
+        "tag:wozlol": ["autogroup:admin"],
     },
 
     "grants": [
         {"src": ["autogroup:member"], "dst": ["*"], "ip": ["*"]},
-        {"src": ["tag:casio"], "dst": ["autogroup:member"], "ip": ["tcp:2222"]},
+        {"src": ["tag:wozlol"], "dst": ["autogroup:member"], "ip": ["tcp:2222"]},
     ],
 
     "ssh": [
@@ -284,7 +284,7 @@ In the admin page open Access controls, then JSON editor. Replace everything wit
 
     "tests": [
         {
-            "src": "tag:casio",
+            "src": "tag:wozlol",
             "accept": ["100.89.194.12:2222"],
             "deny": ["100.89.194.12:22", "100.89.194.12:8000"],
         },
@@ -297,7 +297,7 @@ Change the address in the test to one of your computers. If your Access controls
 ### Part 3, the one-time key
 
 1. In the admin page open Settings, then Keys, then Generate auth key.
-2. Description `casio`. Reusable off. Expiration 1 day. Ephemeral off. Under Tags choose `tag:casio`.
+2. Description `wozlol`. Reusable off. Expiration 1 day. Ephemeral off. Under Tags choose `tag:wozlol`.
 3. Copy the key. It starts with `tskey-`. Do not share it, and do not put it in a file or a chat. Make it right before the next step, because it expires.
 
 ### Part 4, join the handheld
@@ -305,9 +305,9 @@ Change the address in the test to one of your computers. If your Access controls
 1. Install Mode 1 with the Tailscale item. GUI menu, Tailscale should be there.
 2. Be on Wi-Fi at home. GUI menu, Tailscale, move to Join with a key, press Enter, type the key, press Enter.
 3. Wait up to a minute. The Status line goes from Joining to Connected and shows a 100. address.
-4. In the admin page under Machines you should see `casio` with the `tag:casio` tag.
+4. In the admin page under Machines you should see `wozlol` with the `tag:wozlol` tag.
 
-If you would rather not type a key, switch Tailscale on without one. It shows a link on the screen. Open the link on a phone and approve. Then in the admin page under Machines edit the Casio's tags and add `tag:casio`, otherwise it has the same reach as your own devices.
+If you would rather not type a key, switch Tailscale on without one. It shows a link on the screen. Open the link on a phone and approve. Then in the admin page under Machines edit the handheld's tags and add `tag:wozlol`, otherwise it has the same reach as your own devices.
 
 ### Part 5, tell it where each computer is
 
@@ -338,9 +338,9 @@ How it chooses a route: it always tries the home address first for 3 seconds. If
 | Task | How |
 |---|---|
 | Stop using it for now | GUI menu, Tailscale, switch it Off. |
-| Remove the handheld from your tailnet | GUI menu, Tailscale, Forget this device. Then delete `casio` in the admin page under Machines. |
+| Remove the handheld from your tailnet | GUI menu, Tailscale, Forget this device. Then delete `wozlol` in the admin page under Machines. |
 | Stop one handheld reaching your computers | In the helper window type `devices`, then `revoke NAME`. |
-| Cut off the handheld without touching it | Delete `casio` in the admin page under Machines. The key it used is already spent. |
+| Cut off the handheld without touching it | Delete `wozlol` in the admin page under Machines. The key it used is already spent. |
 
 ## Making your own packs
 
@@ -370,7 +370,7 @@ Run the tools with a Python that has Pillow, libzim and cairosvg. Pictures are s
 | Sync command says the handheld is not in sync mode | The handheld is not on the Sync screen, or it connected to a different computer | Open GUI menu, Sync with the computer, and check which computer is in use. |
 | Install says the slot is running | You asked it to overwrite the mode it is running from | Use the loader for that one. |
 | Away connect works at home but not on the hotspot | The hotspot is 5 GHz only, or Tailscale on the computer is stopped | Turn on Maximize Compatibility, and check Tailscale on the computer. |
-| Connect works from the Mac but the handheld times out | The access rule does not allow port 2222 for `tag:casio` | Check Part 2 and the tag on the handheld. |
+| Connect works from the Mac but the handheld times out | The access rule does not allow port 2222 for `tag:wozlol` | Check Part 2 and the tag on the handheld. |
 | A pack is missing from search | It is not in `library`, or it has no `pack.txt` | Check the folder and run the sync again. |
 | Loader says a slot is empty | Nothing is installed there | Install a mode file into it. |
 

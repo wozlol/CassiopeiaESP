@@ -18,12 +18,14 @@
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "jpeg_decoder.h"
 #include "miniz.h"
 #include "sdcard.h"
 #include "settings.h"
 #include "themes.h"
+#include "status_led.h"
 #include "touch.h"
+#include "app_imgview.h"
+#include "app_status.h"
 #include "app_reader.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -182,6 +184,7 @@ static void draw_menu(void) {
     display_set_scrollbar(0, 0, 0);
     clear();
     header("Menu");
+    { char bt[24]; app_battery_text(bt, sizeof bt); if (bt[0]) put(0, TC - (int)strlen(bt) - 1, bt, ATTR_REVERSE); }
     int cw, ch;
     display_cell_size(&cw, &ch);
     char b[100];
@@ -210,6 +213,7 @@ static void apply_theme(int idx) {
 static void apply_brightness(int idx) {
     bright_idx = idx < 0 ? 5 : idx > 5 ? 0 : idx;
     display_set_backlight(BRIGHT[bright_idx]);
+    status_led_set_brightness(BRIGHT[bright_idx]);   // the back light dims with the screen
     settings_set("bl", bright_idx);
 }
 static void msg_show(state_t back, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -720,6 +724,28 @@ static void res_offer(uint8_t pi, uint32_t doc, int score, const char *title) {
     snprintf(res[at].title, sizeof res[at].title, "%.75s", title);
     while (at > 0 && res[at].score > res[at - 1].score) { res_t t = res[at]; res[at] = res[at - 1]; res[at - 1] = t; at--; }
 }
+// In Search everything, a pack whose title has a word you typed ranks above the big general packs. "honda fit" finds the Honda Fit manual first.
+#define TITLE_BONUS 150
+static int title_bonus(int pi) {
+    char low[80], title[96];
+    snprintf(low, sizeof low, "%.79s", query);
+    snprintf(title, sizeof title, " %.90s ", packs[pi].title);
+    for (char *c = low; *c; c++) *c = (char)tolower((unsigned char)*c);
+    for (char *c = title; *c; c++) *c = isalnum((unsigned char)*c) ? (char)tolower((unsigned char)*c) : ' ';
+    int hits = 0;
+    for (const char *q = low; *q;) {
+        while (*q && !isalnum((unsigned char)*q)) q++;
+        char w[28];
+        int n = 0;
+        while (*q && isalnum((unsigned char)*q)) { if (n < 24) w[n++] = *q; q++; }
+        w[n] = 0;
+        if (n < 3 || tok_skip(w)) continue;
+        char pat[32];
+        snprintf(pat, sizeof pat, " %s ", w);
+        if (strstr(title, pat)) hits++;
+    }
+    return hits * TITLE_BONUS;
+}
 static void text_search_pack(int pi, const qterm_t *t, int nt) {
     if (!packs[pi].words) return;
     FILE *fi = open_in(pi, "words.idx"), *fs = open_in(pi, "words.str"), *fp = open_in(pi, "post.dat");
@@ -749,12 +775,13 @@ static void text_search_pack(int pi, const qterm_t *t, int nt) {
     }
     fclose(fi); fclose(fs); fclose(fp);
     // the best few of this pack, matching more of the words ranks higher
+    int tbonus = search_all ? title_bonus(pi) : 0;
     static int bestscore[8];
     static uint32_t bestdoc[8];
     int nb = 0;
     for (int h = 0; h < ACC_N; h++) {
         if (!acc[h].doc1) continue;
-        int sc = (acc[h].score + (acc[h].hits > 1 ? (acc[h].hits - 1) * 60 : 0)) * packs[pi].weight / 100;
+        int sc = (acc[h].score + (acc[h].hits > 1 ? (acc[h].hits - 1) * 60 : 0)) * packs[pi].weight / 100 + tbonus;
         int at = -1;
         if (nb < 8) at = nb++;
         else if (sc > bestscore[7]) at = 7;
@@ -828,79 +855,8 @@ static bool article_open(uint8_t pi, bool doc, uint32_t idx) {
 
 // ----- pictures inside articles -----
 static int img_link = -1;   // which link of the article showed the current picture
-#define SW BOARD_LCD_WIDTH
-#define SH BOARD_LCD_HEIGHT
 // The picture on screen. It starts fitted to the screen. Zoom steps go to bigger, and the arrows or a finger drag move around it. Large pictures,
 // like pages of a manual, are decoded at the size the view needs, so the fitted view is quick and a zoomed view is sharp.
-static uint8_t *iv_jpg; static uint32_t iv_len;
-static uint16_t *iv_buf; static int iv_w, iv_h, iv_den;   // the decoded copy, its size, and the jpeg scale it was decoded at (1, 2, 4 or 8)
-static int iv_fw, iv_fh;                                   // size of the whole picture
-static int iv_level;                                       // 0 fitted, 1 and 2 zoomed in
-static float iv_cx = 0.5f, iv_cy = 0.5f;                   // the middle of the view, as a share of the whole picture
-static void iv_free(void) { free(iv_jpg); free(iv_buf); iv_jpg = NULL; iv_buf = NULL; iv_w = iv_h = iv_den = 0; }
-static float iv_zoom(int level) {
-    float z0 = (float)SW / iv_fw < (float)SH / iv_fh ? (float)SW / iv_fw : (float)SH / iv_fh;
-    if (z0 > 1.0f) z0 = 1.0f;
-    float z1 = z0 < 1.0f ? 1.0f : 2.0f;
-    return level == 0 ? z0 : level == 1 ? z1 : z1 * 2.0f;
-}
-static bool iv_decode(int den) {
-    if (iv_buf && iv_den == den) return true;
-    free(iv_buf); iv_buf = NULL;
-    esp_jpeg_image_cfg_t cfg = {.indata = iv_jpg, .indata_size = iv_len, .out_format = JPEG_IMAGE_FORMAT_RGB565,
-                                .out_scale = den == 1 ? JPEG_IMAGE_SCALE_0 : den == 2 ? JPEG_IMAGE_SCALE_1_2 : den == 4 ? JPEG_IMAGE_SCALE_1_4 : JPEG_IMAGE_SCALE_1_8,
-                                .flags = {.swap_color_bytes = 1}};
-    esp_jpeg_image_output_t info;
-    if (esp_jpeg_get_image_info(&cfg, &info) != ESP_OK) return false;
-    cfg.outbuf_size = (uint32_t)info.width * info.height * 2 + 64;
-    iv_buf = heap_caps_malloc(cfg.outbuf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!iv_buf) return false;
-    cfg.outbuf = (uint8_t *)iv_buf;
-    if (esp_jpeg_decode(&cfg, &info) != ESP_OK) { free(iv_buf); iv_buf = NULL; return false; }
-    iv_w = info.width; iv_h = info.height; iv_den = den;
-    return true;
-}
-static bool iv_render(void) {
-    float z = iv_zoom(iv_level);
-    int den = 1;
-    if (z < 1.0f) { while (den < 8 && 1.0f / (den * 2) >= z) den *= 2; }   // the biggest shrink that still has enough pixels
-    if (!iv_decode(den)) return false;
-    float viewW = SW / z, viewH = SH / z;                                  // how much of the picture the screen shows, in picture pixels
-    float cxF = iv_cx * iv_fw, cyF = iv_cy * iv_fh;
-    if (viewW >= iv_fw) cxF = iv_fw / 2.0f; else { if (cxF < viewW / 2) cxF = viewW / 2; if (cxF > iv_fw - viewW / 2) cxF = iv_fw - viewW / 2; }
-    if (viewH >= iv_fh) cyF = iv_fh / 2.0f; else { if (cyF < viewH / 2) cyF = viewH / 2; if (cyF > iv_fh - viewH / 2) cyF = iv_fh - viewH / 2; }
-    iv_cx = cxF / iv_fw; iv_cy = cyF / iv_fh;
-    uint16_t *screen = heap_caps_calloc((size_t)SW * SH, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!screen) return false;
-    int32_t step = (int32_t)(65536.0f / z / den);                           // decoded pixels per screen pixel, 16.16
-    int32_t fx0 = (int32_t)(((cxF - viewW / 2) / den) * 65536.0f);
-    int32_t fy0 = (int32_t)(((cyF - viewH / 2) / den) * 65536.0f);
-    for (int y = 0; y < SH; y++) {
-        int32_t sy = (fy0 + y * step) >> 16;
-        if (sy < 0 || sy >= iv_h) continue;
-        const uint16_t *row = iv_buf + (size_t)sy * iv_w;
-        uint16_t *out = screen + (size_t)y * SW;
-        int32_t fx = fx0;
-        for (int x = 0; x < SW; x++, fx += step) { int32_t sx = fx >> 16; if (sx >= 0 && sx < iv_w) out[x] = row[sx]; }
-    }
-    display_raw(true);
-    display_draw_pixels(0, 0, SW, SH, screen);
-    free(screen);
-    return true;
-}
-static void iv_close(void) { iv_free(); display_raw(false); }
-static void iv_zoom_to(int level, float cx, float cy) {
-    if (level < 0) level = 0;
-    if (level > 2) level = 2;
-    iv_level = level;
-    if (cx >= 0) { iv_cx = cx; iv_cy = cy; }
-    iv_render();
-}
-static void iv_pan(int dxs, int dys) {   // in screen pixels
-    float z = iv_zoom(iv_level);
-    iv_cx += dxs / z / iv_fw; iv_cy += dys / z / iv_fh;
-    iv_render();
-}
 static bool show_image(int pi, uint32_t n) {
     if (pi < 0 || pi >= npacks || (int)n >= packs[pi].images) return false;
     FILE *fi = open_in(pi, "images.idx"), *fd = open_in(pi, "images.dat");
@@ -913,15 +869,7 @@ static bool show_image(int pi, uint32_t n) {
     if (fi) fclose(fi);
     if (fd) fclose(fd);
     if (!ok) { free(jpg); return false; }
-    iv_free();
-    iv_jpg = jpg; iv_len = len;
-    esp_jpeg_image_cfg_t cfg = {.indata = jpg, .indata_size = len, .out_format = JPEG_IMAGE_FORMAT_RGB565, .out_scale = JPEG_IMAGE_SCALE_0, .flags = {.swap_color_bytes = 1}};
-    esp_jpeg_image_output_t info;
-    if (esp_jpeg_get_image_info(&cfg, &info) != ESP_OK || info.width < 1 || info.height < 1) { iv_free(); return false; }
-    iv_fw = info.width; iv_fh = info.height;
-    iv_level = 0; iv_cx = iv_cy = 0.5f;
-    if (!iv_render()) { iv_close(); return false; }
-    return true;
+    return imgview_open(jpg, len);
 }
 static int pic_link_step(int from, int dir) {   // the next link that is a picture, in the article order
     for (int i = from + dir; i >= 0 && i < nlinks; i += dir) if (!strncmp(linkstr + links[i].tgt, "img:", 4)) return i;
@@ -991,6 +939,7 @@ static void browse(const char *dir) {
         struct stat st;
         if (stat(p, &st) != 0) continue;
         ent_t *x = &ents[nents];
+        memset(x, 0, sizeof *x);   // a slot used before must not keep its old search or topics flag
         snprintf(x->name, sizeof x->name, "%.63s", e->d_name);
         x->dir = S_ISDIR(st.st_mode);
         x->size = (long)st.st_size;
@@ -1506,7 +1455,7 @@ static void power_off(void) { quit_app = APP_SLEEP; }
 
 static void menu_toggle(void) {
     if (state == ST_MENU) { state = menu_back; return; }
-    if (state == ST_IMAGE) { iv_close(); menu_back = ST_TEXT; }
+    if (state == ST_IMAGE) { imgview_close(); menu_back = ST_TEXT; }
     else menu_back = state == ST_FIND || state == ST_MSG ? ST_BROWSE : state;
     menu_sel = 0;
     state = ST_MENU;
@@ -1539,7 +1488,7 @@ static void handle_key(a11_event_t ev) {
     if (!ev.down) return;
     gui_tap = false;
     if (power_off_pending) { if (code == A11_KEY_ON) { power_off_pending = false; display_sleep(false); draw(); } return; }
-    if (code == A11_KEY_OFF) { if (state == ST_IMAGE) { iv_close(); state = ST_TEXT; } power_off(); return; }
+    if (code == A11_KEY_OFF) { if (state == ST_IMAGE) { imgview_close(); state = ST_TEXT; } power_off(); return; }
     if (code == A11_KEY_BACKLIGHT) { apply_brightness(bright_idx == 0 ? 5 : bright_idx - 1); return; }
     if (gui && code == HID_ESC) to_loader();
     if (ctrl && (code == HID_MINUS || code == HID_EQUALS)) {
@@ -1555,17 +1504,14 @@ static void handle_key(a11_event_t ev) {
         case ST_FIND: key_find(code); break;
         case ST_SEARCH: key_search(code); break;
         case ST_MSG: state = msg_back; break;
-        case ST_IMAGE:
-            if (code == HID_EQUALS) iv_zoom_to(iv_level + 1, -1, -1);                 // plus: zoom in
-            else if (code == HID_MINUS) iv_zoom_to(iv_level - 1, -1, -1);             // minus: zoom out
-            else if (code == HID_ENTER) iv_zoom_to(iv_level ? 0 : 1, -1, -1);         // Enter: zoomed in or fitted
-            else if (iv_level > 0 && (code == HID_RIGHT || code == HID_LEFT || code == HID_UP || code == HID_DOWN))   // zoomed in: the arrows move the view
-                iv_pan(code == HID_RIGHT ? SW / 3 : code == HID_LEFT ? -SW / 3 : 0, code == HID_DOWN ? SH / 3 : code == HID_UP ? -SH / 3 : 0);
-            else if (code == HID_RIGHT || code == HID_DOWN || code == HID_SPACE || code == HID_LEFT || code == HID_UP) {   // fitted: next or previous picture of this article
-                int n = pic_link_step(img_link, (code == HID_LEFT || code == HID_UP) ? -1 : 1);
+        case ST_IMAGE: {
+            iv_action_t act = imgview_key(code);
+            if (act == IV_NEXT || act == IV_PREV) {   // fitted: next or previous picture of this article
+                int n = pic_link_step(img_link, act == IV_PREV ? -1 : 1);
                 if (n != img_link && show_image(cur.pack, (uint32_t)atoi(linkstr + links[n].tgt + 4))) { img_link = n; sellink = n; }
-            } else { iv_close(); state = ST_TEXT; sellink = img_link; }
+            } else if (act == IV_CLOSE) { imgview_close(); state = ST_TEXT; sellink = img_link; }
             break;
+        }
     }
 }
 
@@ -1641,24 +1587,7 @@ static void handle_touch(touch_event_t te) {
     int cw, ch;
     display_cell_size(&cw, &ch);
     if (state == ST_IMAGE) {   // a tap zooms in or back out, a drag moves around when zoomed in, holding a finger down closes the picture
-        static int ix, iy, lx, ly;
-        static int64_t it0;
-        static bool moved;
-        int64_t tn = esp_timer_get_time();
-        if (te.type == TOUCH_DOWN) { ix = lx = te.x; iy = ly = te.y; it0 = tn; moved = false; }
-        else if (te.type == TOUCH_MOVE) {
-            if (abs(te.x - ix) > 14 || abs(te.y - iy) > 14) moved = true;
-            if (moved && iv_level > 0) { iv_pan(lx - te.x, ly - te.y); }
-            lx = te.x; ly = te.y;
-        } else if (te.type == TOUCH_UP && !moved) {
-            if (tn - it0 > 700000) { iv_close(); state = ST_TEXT; sellink = img_link; }
-            else if (iv_level == 0) {   // zoom in on the spot touched
-                float z = iv_zoom(0);
-                float cxF = iv_cx * iv_fw, cyF = iv_cy * iv_fh;
-                float px = cxF + (ix - SW / 2) / z, py = cyF + (iy - SH / 2) / z;
-                iv_zoom_to(1, px / iv_fw, py / iv_fh);
-            } else iv_zoom_to(0, -1, -1);
-        }
+        if (imgview_touch(te) == IV_CLOSE) { imgview_close(); state = ST_TEXT; sellink = img_link; }
         return;
     }
     // Dragging the scroll bar on the right edge jumps to the matching place.
@@ -1759,7 +1688,7 @@ app_exit_t reader_app(QueueHandle_t q, QueueHandle_t tq) {
         if (quit_app) break;
         if (changed || esp_timer_get_time() - last_draw > (marquee_on ? 200000 : 1000000)) { draw(); last_draw = esp_timer_get_time(); }
     }
-    if (state == ST_IMAGE) { iv_close(); state = ST_TEXT; }
+    if (state == ST_IMAGE) { imgview_close(); state = ST_TEXT; }
     if (state == ST_MENU) state = menu_back;
     // What is open stays open for next time. Only the screen copies go, Mode 1 puts its own back.
     free(scr); free(back_buf);

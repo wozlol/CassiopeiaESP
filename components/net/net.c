@@ -240,3 +240,10 @@ void net_wake(void) {
     char s[33], p[65];
     if (load_saved(s, sizeof s, p, sizeof p)) net_connect(s, p, false);
 }
+
+int net_signal_percent(void) {
+    wifi_ap_record_t ap;
+    if (net_state() != NET_CONNECTED || esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return -1;
+    int p = 2 * (ap.rssi + 100);   // about -50 dBm and better is full, -100 dBm and worse is empty
+    return p < 0 ? 0 : p > 100 ? 100 : p;
+}

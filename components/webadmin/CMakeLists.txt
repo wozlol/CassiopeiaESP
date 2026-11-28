@@ -1,1 +1,1 @@
-idf_component_register(SRCS "webadmin.c" INCLUDE_DIRS "include" EMBED_TXTFILES "page.html" REQUIRES clipboard sdcard net tunnel prefs PRIV_REQUIRES app_update esp_partition esp_timer fatfs freertos lwip esp_hw_support)
+idf_component_register(SRCS "webadmin.c" INCLUDE_DIRS "include" EMBED_TXTFILES "page.html" REQUIRES clipboard sdcard net tunnel prefs PRIV_REQUIRES brand app_update esp_partition esp_timer fatfs freertos lwip esp_hw_support)

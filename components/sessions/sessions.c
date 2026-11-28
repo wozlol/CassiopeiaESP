@@ -1,4 +1,5 @@
 #include "sessions.h"
+#include "brand.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -199,7 +200,7 @@ sess_state_t sess_poll(void) {
             esp_err_t rc = ssh_client_connect_take_result();
             if (rc == ESP_OK) {
                 state = SESS_ACTIVE;
-                if (kind == SESS_SYNC) syncd_begin("casio");
+                if (kind == SESS_SYNC) syncd_begin(BRAND_HOST);
                 snprintf(fp_seen, sizeof fp_seen, "%s", ssh_client_get_fingerprint());
                 if (kind == SESS_PAIR) deadline = esp_timer_get_time() + PAIR_WAIT_US;   // waiting for a person to say yes
             } else if (rc == SSH_ERR_HOSTKEY_UNKNOWN && kind == SESS_PAIR) {

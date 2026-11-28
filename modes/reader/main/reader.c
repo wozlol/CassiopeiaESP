@@ -988,6 +988,7 @@ static void browse(const char *dir) {
         struct stat st;
         if (stat(p, &st) != 0) continue;
         ent_t *x = &ents[nents];
+        memset(x, 0, sizeof *x);   // a slot used before must not keep its old search or topics flag
         snprintf(x->name, sizeof x->name, "%.63s", e->d_name);
         x->dir = S_ISDIR(st.st_mode);
         x->size = (long)st.st_size;

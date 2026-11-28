@@ -1,4 +1,5 @@
 #include "tunnel.h"
+#include "brand.h"
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
@@ -28,7 +29,7 @@ static void on_state(microlink_t *m, microlink_state_t s, void *u) {
 static void begin(void) {
     microlink_config_t cfg = {
         .auth_key = pending_key[0] ? pending_key : NULL,
-        .device_name = "casio",
+        .device_name = BRAND_HOST,
         .enable_derp = true, .enable_disco = true, .enable_stun = true,
         .max_peers = 8,
     };

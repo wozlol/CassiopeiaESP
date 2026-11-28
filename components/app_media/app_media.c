@@ -24,12 +24,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "i2c_bus.h"
-#include "jpeg_decoder.h"
+#include "app_imgview.h"
+#include "app_status.h"
 #include "app_media.h"
 #include "freertos/queue.h"
 #include "sdcard.h"
 #include "settings.h"
 #include "themes.h"
+#include "status_led.h"
 #include "touch.h"
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
@@ -177,6 +179,7 @@ static void apply_theme(int idx) {
 static void apply_brightness(int idx) {
     bright_idx = idx < 0 ? 5 : idx > 5 ? 0 : idx;
     display_set_backlight(BRIGHT[bright_idx]);
+    status_led_set_brightness(BRIGHT[bright_idx]);   // the back light dims with the screen
     settings_set("bl", bright_idx);
 }
 static void msg_show(state_t back, const char *text) {
@@ -196,6 +199,7 @@ static void draw_menu(void) {
     display_set_scrollbar(0, 0, 0);
     clear();
     header("Menu");
+    { char bt[24]; app_battery_text(bt, sizeof bt); if (bt[0]) put(0, TC - (int)strlen(bt) - 1, bt, ATTR_REVERSE); }
     int cw, ch;
     display_cell_size(&cw, &ch);
     char b[100];
@@ -269,40 +273,7 @@ static int pic_idx;   // index into ents
 static bool show_picture(int idx) {
     char path[400];
     snprintf(path, sizeof path, "%.255s/%.100s", cwd, ents[idx].name);
-    struct stat st;
-    if (stat(path, &st) != 0 || st.st_size <= 0 || st.st_size > MAX_PIC) return false;
-    uint8_t *jpg = heap_caps_malloc((size_t)st.st_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!jpg) return false;
-    FILE *f = fopen(path, "rb");
-    bool ok = f && fread(jpg, 1, (size_t)st.st_size, f) == (size_t)st.st_size;
-    if (f) fclose(f);
-    uint16_t *screen = ok ? heap_caps_calloc((size_t)SW * SH, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : NULL;
-    uint16_t *img = NULL;
-    if (screen) {
-        esp_jpeg_image_cfg_t cfg = {.indata = jpg, .indata_size = (uint32_t)st.st_size, .out_format = JPEG_IMAGE_FORMAT_RGB565, .out_scale = JPEG_IMAGE_SCALE_0, .flags = {.swap_color_bytes = 1}};
-        esp_jpeg_image_output_t info;
-        ok = esp_jpeg_get_image_info(&cfg, &info) == ESP_OK;
-        // smallest reduction that fits the screen
-        esp_jpeg_image_scale_t sc = JPEG_IMAGE_SCALE_0;
-        int w = info.width, h = info.height;
-        while (ok && (w > SW || h > SH) && sc < JPEG_IMAGE_SCALE_1_8) { sc++; w = (info.width + (1 << sc) - 1) >> sc; h = (info.height + (1 << sc) - 1) >> sc; }
-        if (ok) {
-            cfg.out_scale = sc;
-            cfg.outbuf_size = (uint32_t)w * h * 2 + 64;
-            img = heap_caps_malloc(cfg.outbuf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            cfg.outbuf = (uint8_t *)img;
-            ok = img && esp_jpeg_decode(&cfg, &info) == ESP_OK;
-        }
-        if (ok) {
-            int ow = info.width < SW ? info.width : SW, oh = info.height < SH ? info.height : SH;
-            int x0 = (SW - ow) / 2, y0 = (SH - oh) / 2;
-            for (int y = 0; y < oh; y++) memcpy(screen + (size_t)(y0 + y) * SW + x0, img + (size_t)y * info.width, (size_t)ow * 2);
-            display_raw(true);
-            display_draw_pixels(0, 0, SW, SH, screen);
-        }
-    } else ok = false;
-    free(jpg); free(img); free(screen);
-    return ok;
+    return imgview_file(path);   // the shared viewer, with zoom
 }
 static int next_picture(int from, int dir) {
     for (int i = from + dir; i >= 0 && i < nents; i += dir) if (ents[i].kind == 1) return i;
@@ -552,7 +523,7 @@ static void draw(void) {
 }
 
 // ---------- keys ----------
-static void leave_picture(void) { display_raw(false); state = ST_BROWSE; }
+static void leave_picture(void) { imgview_close(); state = ST_BROWSE; }
 static void open_entry(int i) {
     if (i < 0 || i >= nents) return;
     ent_t *x = &ents[i];
@@ -567,7 +538,7 @@ static void open_entry(int i) {
 }
 static void menu_toggle(void) {
     if (state == ST_MENU) { state = menu_back; return; }
-    if (state == ST_PICTURE) { display_raw(false); menu_back = ST_BROWSE; }
+    if (state == ST_PICTURE) { imgview_close(); menu_back = ST_BROWSE; }
     else menu_back = state == ST_MSG ? ST_BROWSE : state;
     menu_sel = 0;
     state = ST_MENU;
@@ -619,11 +590,12 @@ static void handle_key(a11_event_t ev) {
             else if (code == HID_ESC || code == HID_BACKSPACE) go_up();
             else if (c == 't') apply_theme(theme_idx + 1);
             break;
-        case ST_PICTURE:
-            if (code == HID_ESC || code == HID_BACKSPACE || code == HID_ENTER) leave_picture();
-            else if (code == HID_RIGHT || code == HID_DOWN || code == HID_SPACE) { int n = next_picture(pic_idx, 1); if (n != pic_idx) { pic_idx = n; show_picture(n); } }
-            else if (code == HID_LEFT || code == HID_UP) { int n = next_picture(pic_idx, -1); if (n != pic_idx) { pic_idx = n; show_picture(n); } }
+        case ST_PICTURE: {
+            iv_action_t act = imgview_key(code);
+            if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; if (!show_picture(n)) { leave_picture(); msg_show(ST_BROWSE, "That picture could not be shown. Use JPEG up to 6 MB."); } } }
+            else if (act == IV_CLOSE) leave_picture();
             break;
+        }
         case ST_PLAY:
             if (code == HID_ESC || code == HID_BACKSPACE) { play_stop(); state = ST_BROWSE; }
             else if (code == HID_SPACE) play_cmd = 2;
@@ -637,6 +609,10 @@ static void handle_key(a11_event_t ev) {
 }
 static void handle_touch(touch_event_t te) {
     static int start_y;
+    if (state == ST_PICTURE) {   // a tap zooms in or back out, a drag moves around when zoomed in, holding a finger down closes the picture
+        if (imgview_touch(te) == IV_CLOSE) leave_picture();
+        return;
+    }
     int cw, ch;
     display_cell_size(&cw, &ch);
     // Dragging the scroll bar on the right edge jumps to the matching place in the list.
@@ -657,7 +633,7 @@ static void handle_touch(touch_event_t te) {
             int top = btop;
             int r = te.y / ch - 1;
             if (r >= 0 && top + r < nents) { bsel = top + r; open_entry(bsel); }
-        } else if (state == ST_PICTURE) leave_picture();
+        } else if (state == ST_PICTURE) { /* handled above */ }
         else if (state == ST_PLAY) play_cmd = 2;
     }
 }

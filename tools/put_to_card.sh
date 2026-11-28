@@ -1,9 +1,9 @@
 #!/bin/bash
-# Push a file or folder to the Casio's SD card over its web admin. Usage: casio_put.sh <file or folder> [card folder, default downloads]
-# One time setup: put the address from GUI menu, Web admin, in ~/.a11-casio on line 1, like http://casio. Line 2 is the 6 digit code, only if "Ask for a code" is on.
+# Push a file or folder to the handheld's SD card over its web admin. Usage: put_to_card.sh <file or folder> [card folder, default downloads]
+# One time setup: put the address from GUI menu, Web admin, in ~/.wozlol on line 1, like http://wozlol. Line 2 is the 6 digit code, only if "Ask for a code" is on.
 set -e
-CFG="$HOME/.a11-casio"
-[ -f "$CFG" ] || { echo "Missing $CFG. Put the address (like http://casio) on line 1. Add the code on line 2 only if the Casio asks for one."; exit 1; }
+CFG="$HOME/.wozlol"
+[ -f "$CFG" ] || { echo "Missing $CFG. Put the address (like http://wozlol) on line 1. Add the code on line 2 only if the handheld asks for one."; exit 1; }
 URL=$(sed -n 1p "$CFG"); CODE=$(sed -n 2p "$CFG"); CODE="${CODE:-0}"
 SRC="$1"; DEST="${2:-downloads}"
 [ -e "$SRC" ] || { echo "Nothing at $SRC"; exit 1; }

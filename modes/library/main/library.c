@@ -6,6 +6,7 @@
 #include "app_files.h"
 #include "app_media.h"
 #include "app_reader.h"
+#include "app_status.h"
 #include "app_switch.h"
 #include "board.h"
 #include "clipboard.h"
@@ -14,11 +15,13 @@
 #include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "launcher_guard.h"
 #include "sdcard.h"
+#include "status_led.h"
 #include "settings.h"
 #include "themes.h"
 #include "touch.h"
@@ -34,9 +37,13 @@ static bool asleep;
 
 static void draw(void) {
     for (int i = 0; i < cols * rows; i++) scr[i] = (terminal_cell_t){' ', DISPLAY_DEFAULT_FG, DISPLAY_DEFAULT_BG, 0};
-    const char *title = "Library";
+    char title[48];
+    snprintf(title, sizeof title, "Library  v%s", esp_app_get_description()->version);
     for (int c = 0; c < cols; c++) scr[c].attrs = ATTR_REVERSE;
     for (int c = 0; title[c]; c++) { scr[c + 1].cp = (unsigned char)title[c]; scr[c + 1].attrs = ATTR_REVERSE | ATTR_BOLD; }
+    char bt[24];
+    app_battery_text(bt, sizeof bt);
+    for (int c = 0; bt[c]; c++) { int x = cols - (int)strlen(bt) - 2 + c; if (x > 9) { scr[x].cp = (unsigned char)bt[c]; scr[x].attrs = ATTR_REVERSE; } }
     for (int i = 0; i < N_ITEMS; i++) {
         int r = 2 + i;
         char b[60];
@@ -50,6 +57,14 @@ static void draw(void) {
     for (int c = 0; c < cols; c++) scr[r * cols + c].attrs = ATTR_REVERSE;
     for (int c = 0; hint[c] && c < cols - 1; c++) { scr[r * cols + c].cp = (unsigned char)hint[c]; scr[r * cols + c].attrs = ATTR_REVERSE; }
     display_set_cursor(0, 0, CURSOR_NONE);
+}
+
+// Off. The back light goes dark first, it keeps its last color through sleep otherwise. If deep sleep cannot be arranged, light sleep until On.
+static void sleep_now(void) {
+    status_led_off(true);
+    display_sleep(true);
+    if (a11_keys_prepare_sleep()) { touch_sleep(); display_power_off(); a11_keys_deep_sleep(); }
+    asleep = true;
 }
 
 static void to_terminal(void) {
@@ -75,6 +90,8 @@ void app_main(void) {
     a11_keys_start(q);
     QueueHandle_t tq = xQueueCreate(32, sizeof(touch_event_t));
     touch_start(tq);
+    status_led_start();   // the same battery glow as the other programs, and it goes dark with Off
+    status_led_set_brightness(BRIGHT[bright_idx]);
     ESP_LOGI(TAG, "library ready");
     draw();
     for (;;) {
@@ -86,9 +103,9 @@ void app_main(void) {
         }
         if (xQueueReceive(q, &ev, pdMS_TO_TICKS(100)) != pdTRUE || !ev.down) continue;
         note[0] = 0;
-        if (ev.code == A11_KEY_OFF) { display_sleep(true); if (a11_keys_prepare_sleep()) { touch_sleep(); display_power_off(); a11_keys_deep_sleep(); } asleep = true; continue; }
-        if (asleep) { if (ev.code == A11_KEY_ON) { asleep = false; display_sleep(false); changed = true; } else continue; }
-        if (ev.code == A11_KEY_BACKLIGHT) { bright_idx = bright_idx == 0 ? 5 : bright_idx - 1; display_set_backlight(BRIGHT[bright_idx]); settings_set("bl", bright_idx); }
+        if (ev.code == A11_KEY_OFF) { sleep_now(); continue; }
+        if (asleep) { if (ev.code == A11_KEY_ON) { asleep = false; display_sleep(false); status_led_off(false); changed = true; } else continue; }
+        if (ev.code == A11_KEY_BACKLIGHT) { bright_idx = bright_idx == 0 ? 5 : bright_idx - 1; display_set_backlight(BRIGHT[bright_idx]); status_led_set_brightness(BRIGHT[bright_idx]); settings_set("bl", bright_idx); changed = true; }
         else if (ev.code == 82 && sel > 0) { sel--; changed = true; }
         else if (ev.code == 81 && sel < N_ITEMS - 1) { sel++; changed = true; }
         else if (ev.code == 41) to_terminal();
@@ -102,7 +119,10 @@ void app_main(void) {
                 display_set_text_buffer(fresh, cols, rows);
                 free(scr);
                 scr = fresh;
-                if (r == APP_SLEEP) { display_sleep(true); if (a11_keys_prepare_sleep()) { touch_sleep(); display_power_off(); a11_keys_deep_sleep(); } asleep = true; continue; }
+                bright_idx = settings_get("bl", bright_idx);
+                if (bright_idx < 0 || bright_idx > 5) bright_idx = 5;
+                status_led_set_brightness(BRIGHT[bright_idx]);
+                if (r == APP_SLEEP) { sleep_now(); continue; }
             }
             changed = true;
         }

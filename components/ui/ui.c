@@ -180,11 +180,38 @@ static int ov_text(int r, int c, const char *s, int end) { return ov_flow(r, c, 
 static int ov_height(const char *s, int c) { return ov_flow(0, c, s, 0, 1000, false); }
 
 // The title bar. Returns the first row under it.
+// A computer marker, Wi-Fi signal and battery, for the top right of the menu screens. Always in that order, the battery is the far right one.
+// The longest form that fits is used, then a shorter one, then the battery alone.
+static void status_right(char *out, size_t cap, int room) {
+    int sig = net_signal_percent(), mv, pct;
+    bool batt = status_led_battery(&mv, &pct);
+    bool pc = sess_state() == SESS_ACTIVE;
+    char wifi[24] = "", wifi_s[24] = "", bat[24] = "", bat_s[24] = "";
+    if (sig >= 0) { snprintf(wifi, sizeof wifi, "Wi-Fi %d%%", sig); snprintf(wifi_s, sizeof wifi_s, "Wi %d%%", sig); }
+    else { snprintf(wifi, sizeof wifi, net_state() == NET_CONNECTING ? "Wi-Fi ..." : "No Wi-Fi"); snprintf(wifi_s, sizeof wifi_s, net_state() == NET_CONNECTING ? "Wi .." : "No Wi"); }
+    if (batt) { snprintf(bat, sizeof bat, "Batt %d%%%s", pct, status_led_charging() ? "+" : ""); snprintf(bat_s, sizeof bat_s, "Bt %d%%%s", pct, status_led_charging() ? "+" : ""); }
+    for (int form = 0; form < 3; form++) {
+        const char *w = form == 0 ? wifi : form == 1 ? wifi_s : "";
+        const char *bt = form == 0 ? bat : bat_s;
+        char t[96] = "";
+        size_t n = 0;
+        if (pc) n += (size_t)snprintf(t + n, sizeof t - n, "PC");
+        if (w[0]) n += (size_t)snprintf(t + n, sizeof t - n, "%s%s", n ? "  " : "", w);
+        if (bt[0]) n += (size_t)snprintf(t + n, sizeof t - n, "%s%s", n ? "  " : "", bt);
+        if ((int)strlen(t) <= room) { snprintf(out, cap, "%s", t); return; }
+    }
+    out[0] = 0;
+}
 static int header(const char *title) {
     char b[160];
     snprintf(b, sizeof b, " CassiopeiaESP  %s", title);
     int r = ov_flow(0, 0, b, 0, orows / 3 + 1, true);
     for (int i = 0; i < r; i++) ov_row_attr(i, ATTR_REVERSE);
+    if (r == 1) {   // the title took one row, so the right side of it is free
+        char st[100];
+        status_right(st, sizeof st, ocols - (int)strlen(b) - 3);
+        if (st[0]) ov_put(0, ocols - (int)strlen(st) - 1, st, ATTR_REVERSE);
+    }
     return r;
 }
 
@@ -281,6 +308,7 @@ static void apply_font(int idx) {
 
 static void open_ui(ui_state_t s) {
     if (state == UI_OFF) {
+        vterm_hold_cursor(true);
         display_set_text_buffer(ov, ocols, orows);
         display_set_cursor(0, 0, CURSOR_NONE);
     }
@@ -289,6 +317,7 @@ static void open_ui(ui_state_t s) {
 
 static void close_ui(void) {
     state = UI_OFF;
+    vterm_hold_cursor(false);   // the terminal puts its true cursor back
     display_set_text_buffer(vterm_buffer(), term_cols, term_rows);
     vterm_cursor_refresh();
 }
@@ -392,6 +421,7 @@ static void draw_status(void) {
     int r = header("Status") + 1;
     char b[100];
     int64_t up = esp_timer_get_time() / 1000000;
+    snprintf(b, sizeof b, " Version       %s", esp_app_get_description()->version); r = ov_text(r, 0, b, end);
     snprintf(b, sizeof b, " Uptime        %lld s", (long long)up); r = ov_text(r, 0, b, end);
     snprintf(b, sizeof b, " Internal RAM  %u KB free", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); r = ov_text(r, 0, b, end);
     snprintf(b, sizeof b, " Lowest RAM    %u KB free at the worst moment since start", (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024)); r = ov_text(r, 0, b, end);
@@ -435,7 +465,7 @@ static void msg_show(ui_state_t back, const char *fmt, ...) {
     vsnprintf(msg_text, sizeof msg_text, fmt, ap);
     va_end(ap);
     msg_back = back;
-    if (state == UI_OFF) { display_set_text_buffer(ov, ocols, orows); display_set_cursor(0, 0, CURSOR_NONE); }
+    if (state == UI_OFF) { vterm_hold_cursor(true); display_set_text_buffer(ov, ocols, orows); display_set_cursor(0, 0, CURSOR_NONE); }
     state = UI_MSG;
 }
 
@@ -585,7 +615,7 @@ static void pair_start(const char *host, uint16_t port, const char *name) {
 // The computer does not know this device (new key, or the computer forgot it). Pair again on the spot instead of showing an error.
 static void auto_pair(void) {
     sess_end();
-    if (state == UI_OFF) { display_set_text_buffer(ov, ocols, orows); display_set_cursor(0, 0, CURSOR_NONE); }
+    if (state == UI_OFF) { vterm_hold_cursor(true); display_set_text_buffer(ov, ocols, orows); display_set_cursor(0, 0, CURSOR_NONE); }
     if (!pc.host[0]) { msg_show(UI_MENU, "Not paired with a computer yet. Open the GUI menu, Computer, and press A to pair"); return; }
     pair_start(pc.host, pc.port, pc.name);
     if (state == UI_BUSY) snprintf(busy_msg, sizeof busy_msg, "%.20s does not know this device yet. Pairing now ...", pc.name);
@@ -616,7 +646,7 @@ static void find_run(void) {
 
 // The one entry point: Wi-Fi if needed, then pairing if needed, then the session list.
 static void sess_enter(void) {
-    if (state == UI_OFF) { display_set_text_buffer(ov, ocols, orows); display_set_cursor(0, 0, CURSOR_NONE); }
+    if (state == UI_OFF) { vterm_hold_cursor(true); display_set_text_buffer(ov, ocols, orows); display_set_cursor(0, 0, CURSOR_NONE); }
     if (net_state() != NET_CONNECTED) {
         if (net_has_saved() && net_state() != NET_FAILED) {
             busy_kind = BUSY_WIFI;
@@ -660,6 +690,7 @@ static void attach_to(const char *name) {
     settings_set_str(ls_key(), name);
     sel_clear();
     cb.terminal_reset(term_cols, term_rows);   // a blank terminal, the computer repaints it once attached
+    vterm_hold_cursor(true);
     display_set_text_buffer(ov, ocols, orows);
     display_set_cursor(0, 0, CURSOR_NONE);
     busy_kind = BUSY_ATTACH;
@@ -710,7 +741,7 @@ static void key_web(uint16_t code) {
         if (web_sel == W_ON) webadmin_set_enabled(!webadmin_enabled());
         else if (web_sel == W_LAN) webadmin_set_lan(!webadmin_lan());
         else if (web_sel == W_ASK) webadmin_set_ask_code(!webadmin_ask_code());
-        else if (code == HID_ENTER && web_sel == W_NEWCODE) { webadmin_new_code(); msg_show(UI_WEB, "New code %s. Anyone logged in on the page stays logged in until the Casio restarts", webadmin_code()); return; }
+        else if (code == HID_ENTER && web_sel == W_NEWCODE) { webadmin_new_code(); msg_show(UI_WEB, "New code %s. Anyone logged in on the page stays logged in until it restarts", webadmin_code()); return; }
     }
     else if (code == HID_ESC) state = UI_MENU;
     redraw();
@@ -1088,7 +1119,7 @@ static void key_hist(uint16_t code) {
 static void hist_start(const char *name, bool from_term) {
     snprintf(hist_name, sizeof hist_name, "%s", name);
     hist_from_term = from_term;
-    if (state == UI_OFF) { display_set_text_buffer(ov, ocols, orows); display_set_cursor(0, 0, CURSOR_NONE); }
+    if (state == UI_OFF) { vterm_hold_cursor(true); display_set_text_buffer(ov, ocols, orows); display_set_cursor(0, 0, CURSOR_NONE); }
     sess_end();
     sess_set_target(pc.host, pc.port, pc.fp);
     sess_begin(SESS_CAPTURE, hist_name);
@@ -2067,6 +2098,7 @@ static void launch_app(int which) {
     if (!cb.run_app) return;
     shift = ctrl = alt = gui = gui_tap = false;
     state = UI_OFF;
+    vterm_hold_cursor(true);   // the file manager is on screen, the terminal keeps its cursor to itself
     int r = cb.run_app(which);
     shift = ctrl = alt = gui = gui_tap = false;
     int f = settings_get("font", font_idx);
@@ -2103,6 +2135,7 @@ static void deep_sleep_now(void) {
     a11_keys_deep_sleep();
 }
 
+static bool secret_press_empty;   // the secret press was used but the unit had been locked when it went to sleep
 static void wake(void) {
     status_led_off(false);
     asleep = false;
@@ -2110,7 +2143,11 @@ static void wake(void) {
     display_sleep(false);
     net_wake();
     if (held_mask() == wake_mask && keystore_unlocked()) { hold_guard = true; hold_guard_t = esp_timer_get_time(); unlock_now(); }   // the secret press
-    else { lock_screen(); }
+    else {
+        bool pressed = held_mask() == wake_mask;
+        lock_screen();
+        if (pressed) { snprintf(lock_msg, sizeof lock_msg, "No saved key yet. Type the PIN once."); redraw(); }
+    }
 }
 
 static void key_sec(uint16_t code) {
@@ -2404,8 +2441,12 @@ void ui_ready(void) {
         uint16_t codes[16];
         int n = a11_keys_wake_held(codes, 16), m = 0;
         for (int i = 0; i < n; i++) m |= codes[i] == A11_HID_LEFT_SHIFT ? MOD_SHIFT : codes[i] == A11_HID_LEFT_CTRL ? MOD_CTRL : codes[i] == A11_HID_LEFT_ALT ? MOD_ALT : codes[i] == A11_HID_LEFT_GUI ? MOD_GUI : 0;
-        if (n >= 0 && m == wake_mask && keystore_take_stash()) { id_unlock(); net_unlock(); opened = true; hold_guard = true; hold_guard_t = esp_timer_get_time(); }   // the secret press, no PIN
+        if (n >= 0 && m == wake_mask) {
+            if (keystore_take_stash()) { id_unlock(); net_unlock(); opened = true; hold_guard = true; hold_guard_t = esp_timer_get_time(); }   // the secret press, no PIN
+            else secret_press_empty = true;   // nothing was ever unlocked since the unit started, so no key was saved
+        }
     }
-    keystore_wipe_stash();   // anything but the secret press leaves nothing behind
-    if (!opened) lock_screen();
+    // The saved key is kept when the wake was a plain On press. Turning it off again at the PIN prompt then still lets the secret press open it next time.
+    // It only goes when the secret press uses it, and it is gone for good if the power is cut.
+    if (!opened) { lock_screen(); if (secret_press_empty) { snprintf(lock_msg, sizeof lock_msg, "No saved key yet. Type the PIN once."); redraw(); } }
 }

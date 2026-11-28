@@ -102,9 +102,13 @@ static inline void copy_row(int row, int l, int r)
     }
 }
 
+static volatile bool s_cursor_hold;
+void vterm_hold_cursor(bool hold) { s_cursor_hold = hold; }
+
 /* Push tsm's live cursor to the display. Callers hold the vterm lock. */
 static void cursor_refresh(void)
 {
+    if (s_cursor_hold) return;   /* a menu is on screen */
     int cx, cy; bool vis;
     tsm_cursor(s_tsm, &cx, &cy, &vis);
     display_set_cursor(cx, cy, vis ? CURSOR_BLOCK : CURSOR_NONE);
@@ -120,7 +124,8 @@ static void repaint_all(void)
 
     /* Scrolled back, the cursor is off-screen — drawing it at its live
      * coordinates would plant a block on an unrelated line of history. */
-    if (tsm_sb_offset(s_tsm) > 0)
+    if (s_cursor_hold) { /* a menu is on screen */ }
+    else if (tsm_sb_offset(s_tsm) > 0)
         display_set_cursor(0, 0, CURSOR_NONE);
     else
         cursor_refresh();
@@ -240,7 +245,7 @@ esp_err_t vterm_init(int cols, int rows)
     tsm_set_bell_cb(s_tsm, vterm_bell_cb, NULL);
 
     display_set_text_buffer(s_buffer, cols, rows);
-    display_set_cursor(0, 0, CURSOR_BLOCK);
+    display_set_cursor(0, 0, s_cursor_hold ? CURSOR_NONE : CURSOR_BLOCK);   /* a menu may be open while the text size changes */
     s_initialized = true;
     ESP_LOGI(TAG, "vterm ready: %dx%d", cols, rows);
     return ESP_OK;

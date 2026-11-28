@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Casio</title>
+<title>woz.lol</title>
 <style>
 :root{--bg:#0b0d0b;--fg:#d6e8d0;--dim:#8a9a86;--acc:#9dff6a;--card:#141814;--line:#263026;--bad:#ff7a7a}
 @media (prefers-color-scheme: light){:root{--bg:#f4f6f1;--fg:#1d261b;--dim:#5b6858;--acc:#2f7d12;--card:#fff;--line:#d3dbd0;--bad:#b32121}}
@@ -20,9 +20,9 @@ td.n{word-break:break-all}td.s,td.a{white-space:nowrap}td.s{color:var(--dim);tex
 .prog{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin:.3rem 0}.prog i{display:block;height:100%;background:var(--acc);width:0}
 #login{max-width:20rem;margin:20vh auto}#login input{width:100%;margin:.6rem 0;font-size:1.3rem;letter-spacing:.3em;text-align:center}
 </style></head><body><main>
-<div id="login" hidden><h1>Casio</h1><div>Type the code shown on the Casio, GUI menu, Web admin.</div><input id="code" inputmode="numeric" autocomplete="off" maxlength="6"><button class="go" id="loginbtn" style="width:100%">Open</button><div class="msg bad" id="lmsg"></div></div>
+<div id="login" hidden><h1>woz.lol</h1><div>Type the code shown on the device, GUI menu, Web admin.</div><input id="code" inputmode="numeric" autocomplete="off" maxlength="6"><button class="go" id="loginbtn" style="width:100%">Open</button><div class="msg bad" id="lmsg"></div></div>
 <div id="app" hidden>
-<h1>Casio <span id="info" style="font-size:.85rem;color:var(--dim);font-weight:400"></span></h1>
+<h1>woz.lol <span id="info" style="font-size:.85rem;color:var(--dim);font-weight:400"></span></h1>
 <div class="tabs"><button id="t1" class="on">SD card files</button> <button id="t2">Clipboard</button></div>
 <section id="files">
  <div class="bar"><b id="crumbs"></b><span style="flex:1"></span><button id="up">Up</button><button id="mk">New folder</button><button id="rf">Refresh</button></div>
@@ -43,7 +43,7 @@ function showLogin(){$('app').hidden=true;$('login').hidden=false;$('code').focu
 function fmt(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(2)+' GB'}
 function say(el,t,bad){el.textContent=t;el.className='msg'+(bad?' bad':'')}
 async function login(){try{const r=await fetch('/api/login',{method:'POST',headers:H,body:$('code').value});if(!r.ok){say($('lmsg'),await r.text(),true);return}$('login').hidden=true;start()}catch(e){say($('lmsg'),String(e),true)}}
-async function info(){const j=await (await api('/api/info')).json();$('info').textContent=j.free!==undefined?`${fmt(j.free)} free of ${fmt(j.total)}  ·  running ${j.running}`:''}
+async function info(){const j=await (await api('/api/info')).json();$('info').textContent=j.free!==undefined?`v${j.version}  ·  ${fmt(j.free)} free of ${fmt(j.total)}  ·  running ${j.running}`:''}
 function crumbs(){const parts=dir?dir.split('/'):[];let h='<a href="#" data-d="">card</a>',p='';for(const x of parts){p+=(p?'/':'')+x;h+=' / <a href="#" data-d="'+p+'">'+x+'</a>'}$('crumbs').innerHTML=h;$('crumbs').querySelectorAll('a').forEach(a=>a.onclick=e=>{e.preventDefault();go(a.dataset.d)})}
 async function go(d){dir=d;crumbs();say($('msg'),'');const rows=$('rows');rows.innerHTML='';
  try{const j=await (await api('/api/ls?dir='+encodeURIComponent(dir))).json();

@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include "a11_keys.h"
 #include "app_files.h"
+#include "app_imgview.h"
 #include "board.h"
 #include "display.h"
 #include "esp_heap_caps.h"
@@ -19,6 +20,7 @@
 #include "sdcard.h"
 #include "settings.h"
 #include "themes.h"
+#include "status_led.h"
 #include "touch.h"
 
 #define ROOT SDCARD_MOUNT
@@ -36,7 +38,7 @@
 #define HID_UP 82
 static const int BRIGHT[] = {10, 25, 40, 60, 80, 100};
 
-typedef enum { ST_LIST, ST_CONFIRM, ST_NEWDIR, ST_MSG } state_t;
+typedef enum { ST_LIST, ST_CONFIRM, ST_NEWDIR, ST_MSG, ST_PICTURE } state_t;
 static state_t state = ST_LIST;
 static char msg_text[200];
 static terminal_cell_t *scr, *back_buf;
@@ -54,6 +56,7 @@ static char del_path[400], del_name[64];
 static bool del_dir;
 static char nd_buf[48];
 static int last_foot_n = 1;
+static int pic_idx;   // the picture on screen, an index into ents
 
 static void scr_alloc(void) {
     free(scr); free(back_buf);
@@ -129,6 +132,7 @@ static void apply_font(int idx) {
 static void apply_brightness(int idx) {
     bright_idx = idx < 0 ? 5 : idx > 5 ? 0 : idx;
     display_set_backlight(BRIGHT[bright_idx]);
+    status_led_set_brightness(BRIGHT[bright_idx]);   // the back light dims with the screen
     settings_set("bl", bright_idx);
 }
 static void msg_show(const char *fmt, const char *a) { snprintf(msg_text, sizeof msg_text, fmt, a ? a : ""); state = ST_MSG; }
@@ -160,6 +164,20 @@ static void browse(const char *dir) {
     closedir(d);
     qsort(ents, nents, sizeof(ent_t), ent_cmp);
 }
+static bool is_jpeg(const char *n) {
+    const char *e = strrchr(n, '.');
+    return e && (!strcasecmp(e, ".jpg") || !strcasecmp(e, ".jpeg"));
+}
+static bool show_picture(int idx) {
+    char p[400];
+    snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[idx].name);
+    return imgview_file(p);
+}
+static int next_picture(int from, int dir) {
+    for (int i = from + dir; i >= 0 && i < nents; i += dir) if (!ents[i].dir && is_jpeg(ents[i].name)) return i;
+    return from;
+}
+static void leave_picture(void) { imgview_close(); state = ST_LIST; }
 static void go_up(void) {
     if (!strcmp(cwd, ROOT)) { quit_app = APP_BACK; return; }   // Esc at the top of the card leaves the file manager
     char *s = strrchr(cwd, '/');
@@ -229,7 +247,7 @@ static void draw_screen(void) {
     footer(hint);
 }
 static void draw(void) {
-    if (!back_buf) return;
+    if (!back_buf || state == ST_PICTURE) return;
     terminal_cell_t *live = scr;
     scr = back_buf;
     draw_screen();
@@ -250,6 +268,12 @@ static void key_list(uint16_t code) {
     else if (code == HID_PGUP) bsel = bsel > vis ? bsel - vis : 0;
     else if (code == HID_PGDN) bsel = bsel + vis < nents ? bsel + vis : (nents ? nents - 1 : 0);
     else if (code == HID_ENTER && nents && ents[bsel].dir) { char p[400]; snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[bsel].name); browse(p); }
+    else if (code == HID_ENTER && nents && is_jpeg(ents[bsel].name)) {
+        pic_idx = bsel;
+        state = ST_PICTURE;
+        if (!show_picture(bsel)) { leave_picture(); msg_show("%s could not be shown. Pictures must be JPEG, up to 6 MB.", ents[bsel].name); }
+    }
+    else if (code == HID_ENTER && nents) msg_show("%s is not a picture. Open sounds in Media and documents in Reader.", ents[bsel].name);
     else if (code == HID_ESC || code == HID_BACKSPACE) go_up();
     else if (c == 'd' && nents) {
         snprintf(del_name, sizeof del_name, "%s", ents[bsel].name);
@@ -305,11 +329,17 @@ static void handle_key(a11_event_t ev) {
     if (code == A11_KEY_OFF) { quit_app = APP_SLEEP; return; }
     if (code == A11_KEY_BACKLIGHT) { apply_brightness(bright_idx == 0 ? 5 : bright_idx - 1); return; }
     if (gui && code == HID_ESC) to_loader();
-    if (ctrl && (code == HID_MINUS || code == HID_EQUALS)) { apply_font(font_idx + (code == HID_EQUALS ? 1 : -1)); if (state == ST_LIST) browse(cwd); return; }
+    if (ctrl && state != ST_PICTURE && (code == HID_MINUS || code == HID_EQUALS)) { apply_font(font_idx + (code == HID_EQUALS ? 1 : -1)); if (state == ST_LIST) browse(cwd); return; }
     switch (state) {
         case ST_LIST: key_list(code); break;
         case ST_NEWDIR: key_newdir(code); break;
         case ST_MSG: state = ST_LIST; break;
+        case ST_PICTURE: {
+            iv_action_t act = imgview_key(code);
+            if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; bsel = n; if (!show_picture(n)) { leave_picture(); msg_show("%s could not be shown.", ents[n].name); } } }
+            else if (act == IV_CLOSE) leave_picture();
+            break;
+        }
         case ST_CONFIRM:
             if (a11_hid_to_char(code, false, false) == 'y') {
                 bool ok = rm_tree(del_path);
@@ -324,6 +354,7 @@ static void handle_touch(touch_event_t te) {
     static int start_y;
     int cw, ch;
     display_cell_size(&cw, &ch);
+    if (state == ST_PICTURE) { if (imgview_touch(te) == IV_CLOSE) leave_picture(); return; }
     if (te.type == TOUCH_DOWN) { start_y = te.y; return; }
     if (te.type == TOUCH_UP && abs(te.y - start_y) < 8 && state == ST_LIST) {
         int r = te.y / ch - 1;
@@ -359,6 +390,7 @@ app_exit_t files_app(QueueHandle_t q, QueueHandle_t tq) {
         int64_t now = esp_timer_get_time();
         if (changed || now - last_draw > 1000000) { draw(); last_draw = now; }
     }
+    if (state == ST_PICTURE) leave_picture();
     free(scr); free(back_buf);
     scr = back_buf = NULL;
     display_set_scrollbar(0, 0, 0);

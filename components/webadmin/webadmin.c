@@ -1,3 +1,4 @@
+#include "brand.h"
 #include "mdns.h"
 #include "webadmin.h"
 #include <ctype.h>
@@ -56,8 +57,8 @@ const char *webadmin_state_text(void) { return state_text; }
 int webadmin_addresses(char out[4][48]) {
     int n = 0;
     char ip[24];
-    if (tunnel_ip(ip, sizeof ip)) { snprintf(out[n++], 48, "http://casio"); snprintf(out[n++], 48, "http://%s", ip); }
-    if (lan && net_state() == NET_CONNECTED) { snprintf(out[n++], 48, "http://casio.local"); snprintf(out[n++], 48, "http://%s", net_ip()); }
+    if (tunnel_ip(ip, sizeof ip)) { snprintf(out[n++], 48, "http://" BRAND_HOST); snprintf(out[n++], 48, "http://%s", ip); }
+    if (lan && net_state() == NET_CONNECTED) { snprintf(out[n++], 48, "http://" BRAND_HOST ".local"); snprintf(out[n++], 48, "http://%s", net_ip()); }
     return n;
 }
 
@@ -172,7 +173,8 @@ static void api_info(int fd) {
     esp_vfs_fat_info(SDCARD_MOUNT, &total, &freeb);
     const esp_partition_t *run = esp_ota_get_running_partition();
     char b[200];
-    int n = snprintf(b, sizeof b, "{\"total\":%llu,\"free\":%llu,\"running\":\"%s\"}", (unsigned long long)total, (unsigned long long)freeb, run ? run->label : "");
+    const esp_app_desc_t *ad = esp_app_get_description();
+    int n = snprintf(b, sizeof b, "{\"total\":%llu,\"free\":%llu,\"running\":\"%s\",\"version\":\"%s\"}", (unsigned long long)total, (unsigned long long)freeb, run ? run->label : "", ad ? ad->version : "");
     head(fd, 200, "application/json", n, NULL);
     send_all(fd, b, (size_t)n);
 }
@@ -353,12 +355,12 @@ static bool ct_equal(const char *a, const char *b) {
     for (size_t i = 0; i < la && i < lb; i++) d |= (unsigned)(a[i] ^ b[i]);
     return d == 0;
 }
-static bool host_ok(const char *h) {   // an address or the name casio, so a web page somewhere else cannot point its own name at this
+static bool host_ok(const char *h) {   // an address or the brand name, so a web page somewhere else cannot point its own name at this
     char n[80];
     snprintf(n, sizeof n, "%s", h);
     char *c = strchr(n, ':');
     if (c) *c = 0;
-    if (!strncasecmp(n, "casio", 5)) return true;
+    if (!strncasecmp(n, BRAND_HOST, strlen(BRAND_HOST))) return true;
     for (char *p = n; *p; p++) if (!isdigit((unsigned char)*p) && *p != '.') return false;
     return n[0] != 0;
 }
@@ -467,17 +469,17 @@ static void conn_task(void *arg) {
 static void close_listener(void) {
     if (listen_fd >= 0) { close(listen_fd); listen_fd = -1; }
 }
-static bool mdns_up;   // announcing casio.local on the home Wi-Fi, only while the home Wi-Fi switch is on
+static bool mdns_up;   // announcing the brand name .local on the home Wi-Fi, only while the home Wi-Fi switch is on
 static void supervisor(void *arg) {
     for (;;) {
         bool want_name = enabled && lan && net_state() == NET_CONNECTED;
         if (want_name && !mdns_up) {
             if (mdns_init() == ESP_OK) {
-                mdns_hostname_set("casio");
-                mdns_instance_name_set("Casio web admin");
+                mdns_hostname_set(BRAND_HOST);
+                mdns_instance_name_set(BRAND_NAME " web admin");
                 mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
                 mdns_up = true;
-            } else ESP_LOGW(TAG, "casio.local could not start");
+            } else ESP_LOGW(TAG, BRAND_HOST ".local could not start");
         } else if (!want_name && mdns_up) { mdns_free(); mdns_up = false; }
         char ip[24] = "";
         bool ts = tunnel_ip(ip, sizeof ip);

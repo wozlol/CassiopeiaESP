@@ -15,4 +15,4 @@ RS=(rsync -rt --modify-window=2 --exclude='._*' --exclude='*.tmp' --exclude='.DS
 "${RS[@]}" "$HERE/modes/sd/modes/" "$VOL/modes/" || { echo "Copy failed, the card is not complete."; exit 1; }            # mode images for the loader
 dot_clean -m "$VOL" 2>/dev/null
 echo "Copy finished. Used on the card now: $(du -sh "$VOL/library" | cut -f1) library, $(du -sh "$VOL/media" | cut -f1) media"
-echo "Eject it in Finder, put it back in the Casio."
+echo "Eject it in Finder, put it back in the handheld."

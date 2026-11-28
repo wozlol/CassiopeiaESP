@@ -1,1 +1,1 @@
-idf_component_register(SRCS "app_reader.c" INCLUDE_DIRS "include" REQUIRES app_common PRIV_REQUIRES clipboard display a11_keys touch prefs sdcard board a11_font esp_rom esp_timer esp_system app_update esp_partition esp_driver_gpio)
+idf_component_register(SRCS "app_reader.c" INCLUDE_DIRS "include" REQUIRES app_common app_imgview PRIV_REQUIRES status_led clipboard display a11_keys touch prefs sdcard board a11_font esp_rom esp_timer esp_system app_update esp_partition esp_driver_gpio)

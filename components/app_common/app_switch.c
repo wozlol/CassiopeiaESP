@@ -3,6 +3,9 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
+#include "app_status.h"
+#include "status_led.h"
+#include <stdio.h>
 
 bool app_switch(const char *project_name) {
     for (int i = 0; i < 4; i++) {
@@ -14,4 +17,10 @@ bool app_switch(const char *project_name) {
         esp_restart();
     }
     return false;
+}
+
+void app_battery_text(char *out, size_t cap) {
+    int mv, pct;
+    if (status_led_battery(&mv, &pct)) snprintf(out, cap, "Batt %d%%%s", pct, status_led_charging() ? "+" : "");
+    else if (cap) out[0] = 0;
 }

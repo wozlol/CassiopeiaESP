@@ -148,6 +148,10 @@ Same or separate: separate. Video and music want big decode and audio buffers an
 - Loader now has four slots (ota_0 to ota_3, 2.5 MB each, storage stays where it is so the encrypted key and settings survive). Built, not flashed yet.
 - Old note, media viewer: planned only. Shared pieces done: prefs, sdcard, display raw bitmap mode (display_raw, display_draw_pixels), loader can receive folders (loader.py putdir LOCAL library/NAME or media/NAME). The panel clock is 40 MHz which tops out near 16 frames a second at full screen 480x320, so video may need 80 MHz or a letterbox.
 
+## Future machines, noted 2026-11-27
+
+The same firmware idea, a keyboard handheld that runs a terminal, a reader and a media viewer, is planned for a second machine later, such as an HP or Sharp pocket computer. The first Casio programs stay in the project as reference for that port: modes/reader, modes/media, modes/shell0, modes/keytest, modes/screentest, modes/hello and modes/tailnet. They are no longer installed on the card. The Library program (modes/library) replaced the reader and media. The shared pieces to carry over are the components: app_reader, app_media, app_files, app_common, display, a11_keys, ui, webadmin, keystore and sessions.
+
 ## Safety ledger
 
 Anything opened, enabled or relaxed gets a line here and a closing step. Status is Open, Accepted with the reason, or Closed.
@@ -170,3 +174,7 @@ Anything opened, enabled or relaxed gets a line here and a closing step. Status 
 | 2026-11-12 | Homebrew installs on the Mac: cmake, ninja, go, tmux | Dev tools only, remove with brew uninstall if not wanted | Accepted |
 | 2026-11-12 | Wi-Fi password saved in plain text in NVS | Sealed with the PIN key since 2026-11-23, the plain copy was removed on first use. Leftover plain copies may remain in unused flash until overwritten, changing the Wi-Fi password makes them useless. Flash encryption is an irreversible eFuse step, see the eFuse line | Mostly closed |
 | 2026-11-12 | Device SSH private key stored as a plain file on the internal storage partition (/store/id_ed25519) | Replace with the encrypted key store (Argon2id and XChaCha20 from Esperdeck) and the wake PIN before this stage is Done. Revoke from the computer with revoke in the helper | Open |
+| 2026-11-26 | Web admin page on the handheld (components/webadmin), port 80, SD card files and clipboard history, read, upload, delete | Listens on the Tailscale address only, plus the home Wi-Fi only if that switch is on (off by default). A 6 digit code is asked only if Ask for a code is on, default off. Requests need a custom header, a Host name that is an IP number or starts with the brand name (wozlol), and paths are limited to modes, library, media and downloads. Turn the whole page off on the Web admin screen | Accepted by the owner, anyone on the same network can reach the card and the clipboard history while the page is on |
+| 2026-11-26 | wozlol.local announced on the home Wi-Fi (mDNS) | Runs only while the home Wi-Fi switch is on | Accepted |
+| 2026-11-26 | Library program has no PIN lock | It holds no keys. It shows the card files and the clipboard history to anyone holding the unit | Accepted |
+| 2026-11-27 | The saved key for the secret press now stays in memory across a plain wake and Off at the PIN prompt, until the secret press uses it | Cleared when used, lost if the power is cut. Anyone who knows the secret keys and holds the unit could open it, as before, for a longer time. Debug port still open | Accepted by the owner |
