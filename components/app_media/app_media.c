@@ -40,7 +40,7 @@ static const char *TAG = "media";
 #define ROOT SDCARD_MOUNT "/media"
 #define MAX_ENT 400
 #define MAX_PIC (6 * 1024 * 1024)
-#define VOL_CAP 75
+#define VOL_CAP 100   // the top of the scale. Above 75 the sound is boosted past the level of the file, loud recordings will distort
 #define HID_ENTER 40
 #define HID_ESC 41
 #define HID_BACKSPACE 42
@@ -296,10 +296,14 @@ static const audio_codec_ctrl_if_t *g_ctrl;
 // What the audio chip says about itself right after it was opened, for the log.
 static void codec_dump(const char *when) {
     if (!g_ctrl) return;
-    static const uint8_t REGS[] = {0x00, 0x01, 0x09, 0x0A, 0x0D, 0x12, 0x13, 0x31, 0x32};
-    char b[160]; int n = 0;
-    for (size_t i = 0; i < sizeof REGS; i++) { uint8_t v = 0xEE; g_ctrl->read_reg(g_ctrl, REGS[i], 1, &v, 1); n += snprintf(b + n, sizeof b - (size_t)n, " %02X=%02X", REGS[i], v); }
-    ESP_LOGI(TAG, "ES8311 %s:%s, PA pin level %d, volume %d", when, b, gpio_get_level(1), (int)vol);
+    char b[260]; int n = 0;
+    for (int reg = 0; reg <= 0x45; reg++) {
+        uint8_t v = 0xEE;
+        g_ctrl->read_reg(g_ctrl, reg, 1, &v, 1);
+        n += snprintf(b + n, sizeof b - (size_t)n, "%02X=%02X ", reg, v);
+        if (reg == 0x22 || reg == 0x45) { ESP_LOGI(TAG, "ES8311 %s: %s", when, b); n = 0; }
+    }
+    ESP_LOGI(TAG, "ES8311 PA pin level %d, volume %d", gpio_get_level(1), (int)vol);
 }
 static bool audio_init(void) {
     if (audio_ready) return true;
@@ -310,7 +314,7 @@ static bool audio_init(void) {
     i2s_std_config_t sc = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {.mclk = 4, .bclk = 5, .ws = 7, .dout = 6, .din = I2S_GPIO_UNUSED, .invert_flags = {0}},   // GPIO6 first: PLAN.md named 6 and 8 without saying which way round they go
+        .gpio_cfg = {.mclk = 4, .bclk = 5, .ws = 7, .dout = 8, .din = I2S_GPIO_UNUSED, .invert_flags = {0}},   // GPIO8 is the data to the codec and GPIO6 the microphone data back, as in Freenove's own music sketch
     };
     sc.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     if (i2s_channel_init_std_mode(tx, &sc) != ESP_OK) return false;
@@ -321,7 +325,7 @@ static bool audio_init(void) {
     audio_codec_i2c_cfg_t i2c = {.port = I2C_NUM_0, .addr = ES8311_CODEC_DEFAULT_ADDR, .bus_handle = bus};
     const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c);
     const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
-    es8311_codec_cfg_t ec = {.ctrl_if = ctrl_if, .gpio_if = gpio_if, .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC, .pa_pin = 1, .use_mclk = true, .hw_gain = {.pa_voltage = 5.0, .codec_dac_voltage = 3.3}};
+    es8311_codec_cfg_t ec = {.ctrl_if = ctrl_if, .gpio_if = gpio_if, .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC, .pa_pin = 1, .pa_reverted = true, .use_mclk = true, .hw_gain = {.pa_voltage = 5.0, .codec_dac_voltage = 3.3}};
     const audio_codec_if_t *codec_if = es8311_codec_new(&ec);
     if (!data_if || !ctrl_if || !gpio_if || !codec_if) return false;
     esp_codec_dev_cfg_t dc = {.dev_type = ESP_CODEC_DEV_TYPE_OUT, .codec_if = codec_if, .data_if = data_if};
@@ -329,27 +333,27 @@ static bool audio_init(void) {
     audio_ready = codec != NULL;
     if (audio_ready) {
         // A volume curve that is usable on the small speaker. The default one spends half its range below minus 25 dB where nothing can be heard.
-        esp_codec_dev_vol_map_t map[] = {{1, -45.0f}, {10, -24.0f}, {30, -12.0f}, {55, -5.0f}, {75, 0.0f}, {100, 0.0f}};
+        esp_codec_dev_vol_map_t map[] = {{1, -45.0f}, {10, -24.0f}, {30, -12.0f}, {55, -5.0f}, {75, 0.0f}, {100, 9.0f}};
         esp_codec_dev_vol_curve_t curve = {.vol_map = map, .count = (int)(sizeof map / sizeof map[0])};
         esp_codec_dev_set_vol_curve(codec, &curve);
         g_ctrl = ctrl_if;
-        // The switch of the speaker amplifier is GPIO1, high is on. The codec library was meant to set it, but it read low while a sound was
-        // supposed to play, so it is driven here too and kept on.
+        // The switch of the speaker amplifier is GPIO1 and low is on. It is driven here as well as by the codec library, and kept on.
         gpio_config_t pa = {.pin_bit_mask = 1ULL << 1, .mode = GPIO_MODE_INPUT_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE};
         gpio_config(&pa);
-        gpio_set_level(1, 1);
+        gpio_set_level(1, 0);   // low turns the amplifier on, as in Freenove's own sketch
     }
     return audio_ready;
 }
 
+// Always sent as stereo, left and right the same for a mono sound, which is how the board's own example feeds the codec.
 static void pcm_out(const int16_t *pcm, int frames, int ch) {
-    static int16_t mono[1152];
+    static int16_t st[1152 * 2];
     int off = 0;
     while (off < frames) {
         int n = frames - off > 1152 ? 1152 : frames - off;
-        if (ch == 2) for (int i = 0; i < n; i++) mono[i] = (int16_t)(((int)pcm[(off + i) * 2] + pcm[(off + i) * 2 + 1]) / 2);
-        else memcpy(mono, pcm + off, (size_t)n * 2);
-        int wr = esp_codec_dev_write(codec, mono, n * 2);
+        if (ch == 2) memcpy(st, pcm + (size_t)off * 2, (size_t)n * 4);
+        else for (int i = 0; i < n; i++) st[2 * i] = st[2 * i + 1] = pcm[off + i];
+        int wr = esp_codec_dev_write(codec, st, n * 4);
         static int wr_logged;
         if (wr != ESP_CODEC_DEV_OK && wr_logged++ < 3) ESP_LOGW(TAG, "audio write returned %d", wr);
         off += n;
@@ -367,35 +371,57 @@ static bool wait_if_paused(void) {   // true when the track should stop
 static void play_wav(FILE *f) {
     uint8_t h[12];
     if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) return;
-    int ch = 0, rate = 0, bits = 0;
+    int ch = 0, rate = 0, bits = 0, tag = 0;
     uint32_t data_len = 0;
     for (;;) {
         uint8_t ck[8];
         if (fread(ck, 1, 8, f) != 8) return;
         uint32_t len = ck[4] | ck[5] << 8 | ck[6] << 16 | (uint32_t)ck[7] << 24;
         if (!memcmp(ck, "fmt ", 4)) {
-            uint8_t fm[16];
+            uint8_t fm[40];
             if (len < 16 || fread(fm, 1, 16, f) != 16) return;
+            tag = fm[0] | fm[1] << 8;
             ch = fm[2] | fm[3] << 8; rate = fm[4] | fm[5] << 8 | fm[6] << 16 | fm[7] << 24; bits = fm[14] | fm[15] << 8;
-            fseek(f, (long)(len - 16 + (len & 1)), SEEK_CUR);
+            uint32_t used = 16;
+            if (tag == 0xFFFE && len >= 40 && fread(fm + 16, 1, 24, f) == 24) { tag = fm[24] | fm[25] << 8; used = 40; }   // the format code of an extensible header is inside it
+            fseek(f, (long)(len - used + (len & 1)), SEEK_CUR);
         } else if (!memcmp(ck, "data", 4)) { data_len = len; break; }
         else fseek(f, (long)(len + (len & 1)), SEEK_CUR);
     }
-    if (bits != 16 || (ch != 1 && ch != 2) || rate < 8000 || rate > 48000) return;
-    total_ms = (uint32_t)((uint64_t)data_len / (uint32_t)(ch * 2) * 1000 / (uint32_t)rate);
-    esp_codec_dev_sample_info_t fs = {.bits_per_sample = 16, .channel = 1, .sample_rate = (uint32_t)rate};
+    // Plain PCM of 8, 16, 24 or 32 bits, mono or stereo. Above 48 kHz every second frame is dropped, so 88.2 and 96 kHz play as 44.1 and 48.
+    int dec = rate > 48000 ? 2 : 1;
+    if (tag != 1 || (bits != 8 && bits != 16 && bits != 24 && bits != 32) || (ch != 1 && ch != 2) || rate < 8000 || rate > 96000) { ESP_LOGW(TAG, "wav not played: format %d, %d channels, %d bits, %d Hz", tag, ch, bits, rate); return; }
+    int bps = bits / 8, bpf = ch * bps;   // bytes for one sample, and for one frame
+    bool unknown_len = data_len == 0 || data_len == 0xFFFFFFFFu;
+    total_ms = unknown_len ? 0 : (uint32_t)((uint64_t)data_len / (uint32_t)bpf * 1000 / (uint32_t)rate);
+    esp_codec_dev_sample_info_t fs = {.bits_per_sample = 16, .channel = 2, .sample_rate = (uint32_t)(rate / dec)};
     if (esp_codec_dev_open(codec, &fs) != ESP_CODEC_DEV_OK) return;
     esp_codec_dev_set_out_vol(codec, vol);
-    gpio_set_level(1, 1);   // the amplifier stays on while a sound plays
+    gpio_set_level(1, 0);   // the amplifier stays on while a sound plays
     codec_dump("wav opened");
-    static int16_t buf[2048];
-    uint64_t frames_done = 0;
-    while (!feof(f)) {
+    enum { FR = 1024 };
+    static uint8_t raw[FR * 8];
+    static int16_t buf[FR * 2];
+    uint64_t frames_done = 0, left = unknown_len ? UINT64_MAX : data_len;
+    int last_vol = -1;
+    while (left >= (uint64_t)bpf) {
         if (wait_if_paused()) break;
-        esp_codec_dev_set_out_vol(codec, vol);
-        size_t n = fread(buf, 2 * (size_t)ch, 1024, f);
+        if (vol != last_vol) { esp_codec_dev_set_out_vol(codec, vol); last_vol = vol; }   // only when it was changed
+        size_t want = FR;
+        if ((uint64_t)want * (uint64_t)bpf > left) want = (size_t)(left / (uint64_t)bpf);
+        size_t n = fread(raw, (size_t)bpf, want, f);
         if (!n) break;
-        pcm_out(buf, (int)n, ch);
+        if (left != UINT64_MAX) left -= (uint64_t)n * (uint64_t)bpf;
+        int out = 0;
+        for (size_t i = 0; i < n; i += (size_t)dec) {
+            for (int c = 0; c < ch; c++) {
+                const uint8_t *p = raw + i * (size_t)bpf + (size_t)c * (size_t)bps;
+                int16_t v = bits == 8 ? (int16_t)(((int)p[0] - 128) << 8) : bits == 16 ? (int16_t)(p[0] | (p[1] << 8)) : bits == 24 ? (int16_t)(p[1] | (p[2] << 8)) : (int16_t)(p[2] | (p[3] << 8));
+                buf[out * ch + c] = v;
+            }
+            out++;
+        }
+        pcm_out(buf, out, ch);
         frames_done += n;
         played_ms = (uint32_t)(frames_done * 1000 / (uint32_t)rate);
     }
@@ -428,11 +454,11 @@ static void play_mp3(FILE *f) {
             if (!opened) {
                 rate = info.hz; bitrate_kbps = info.bitrate_kbps;
                 if (bitrate_kbps > 0) total_ms = (uint32_t)((int64_t)fsize * 8 / bitrate_kbps);
-                esp_codec_dev_sample_info_t fs = {.bits_per_sample = 16, .channel = 1, .sample_rate = (uint32_t)rate};
+                esp_codec_dev_sample_info_t fs = {.bits_per_sample = 16, .channel = 2, .sample_rate = (uint32_t)rate};
                 if (esp_codec_dev_open(codec, &fs) != ESP_CODEC_DEV_OK) break;
                 opened = true;
                 esp_codec_dev_set_out_vol(codec, vol);
-                gpio_set_level(1, 1);
+                gpio_set_level(1, 0);
                 codec_dump("mp3 opened");
             }
             esp_codec_dev_set_out_vol(codec, vol);

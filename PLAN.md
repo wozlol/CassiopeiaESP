@@ -152,6 +152,21 @@ Same or separate: separate. Video and music want big decode and audio buffers an
 
 The same firmware idea, a keyboard handheld that runs a terminal, a reader and a media viewer, is planned for a second machine later, such as an HP or Sharp pocket computer. The first Casio programs stay in the project as reference for that port: modes/reader, modes/media, modes/shell0, modes/keytest, modes/screentest, modes/hello and modes/tailnet. They are no longer installed on the card. The Library program (modes/library) replaced the reader and media. The shared pieces to carry over are the components: app_reader, app_media, app_files, app_common, display, a11_keys, ui, webadmin, keystore and sessions.
 
+## Audio, working 2026-11-27
+
+Known good setup, from Freenove's own music sketch (github.com/Freenove/Freenove_ESP32_S3_Display, Tutorial_With_Touch/Sketches/Sketch_07.1_Music) and confirmed on this unit.
+
+| Item | Value |
+|---|---|
+| I2S pins | MCLK 4, BCLK 5, WS 7, data to the codec GPIO8, microphone data back GPIO6 |
+| Speaker amplifier enable | GPIO1, low is on |
+| I2C | SDA 16, SCL 15, ES8311 address 0x18 (0x30 in the library's 8 bit form) |
+| I2S format | 16 bit, stereo, left and right the same for a mono sound |
+| Codec registers once open | 00=80 01=3F 09=0C 0A=0C 0D=01 0E=02 12=00 13=10 1C=6A 37=08, volume register 32 follows the volume |
+| What was wrong first | the data pin guessed as 6, the amplifier driven high, a mono slot |
+
+Volume runs 0 to 100. 75 is the level of the file, above that the sound is boosted up to 9 dB at 100. WAV files play as plain PCM of 8, 16, 24 or 32 bits, mono or stereo, up to 96 kHz (above 48 kHz every second frame is dropped).
+
 ## Safety ledger
 
 Anything opened, enabled or relaxed gets a line here and a closing step. Status is Open, Accepted with the reason, or Closed.
