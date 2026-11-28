@@ -2037,7 +2037,7 @@ static void draw_sec_capture(void) {
 
 static void draw_lock(void) {
     ov_clear();
-    const char *hint = " Type the PIN, then Enter";
+    const char *hint = " Type the PIN, then Enter    GUI and L opens the Library    GUI and Esc opens the loader";
     int end = orows - foot_h(hint);
     int r = header("Locked") + 2;
     r = ov_text(r, 1, "Enter your PIN", end) + 1;
@@ -2324,7 +2324,13 @@ bool ui_handle(a11_event_t *evp) {
     if (ev.down) gui_tap = false;
     if (ev.down && code == A11_HID_CAPS_LOCK) { set_caps(!caps); return state != UI_OFF; }
     if (!ev.down) return state != UI_OFF;
-    if (state == UI_LOCK) { key_lock(code); return true; }
+    if (state == UI_LOCK) {
+        // The Library and the loader are open from the PIN screen. The Library holds no keys, and the loader is open to anyone who holds the unit.
+        if (gui && code == A11_HID_ESCAPE) to_loader();
+        if (gui && a11_hid_to_char(code, false, false) == 'l') { app_switch("library"); return true; }
+        key_lock(code);
+        return true;
+    }
     if (code == A11_KEY_ON) { if (state == UI_SEC_CAPTURE) key_sec_capture(code); return true; }
     if (gui && code == A11_HID_ESCAPE) to_loader();
     if (alt && code == 25 && state != UI_SEC_CAPTURE) {   // Alt V, the clipboard manager

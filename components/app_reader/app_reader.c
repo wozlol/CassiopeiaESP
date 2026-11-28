@@ -189,10 +189,11 @@ static void draw_menu(void) {
     display_cell_size(&cw, &ch);
     char b[100];
     put(2, 1, "Back to the terminal (restarts)", 0);
-    snprintf(b, sizeof b, "Theme        < %s >", themes_get(theme_idx)->name); put(3, 1, b, 0);
-    snprintf(b, sizeof b, "Text size    < %dx%d, %dx%d cells >", cw, ch, cols, rows); put(4, 1, b, 0);
-    snprintf(b, sizeof b, "Brightness   < %d%% >", BRIGHT[bright_idx]); put(5, 1, b, 0);
-    put(6, 1, "Close", 0);
+    put(3, 1, "Open the loader (restarts)", 0);
+    snprintf(b, sizeof b, "Theme        < %s >", themes_get(theme_idx)->name); put(4, 1, b, 0);
+    snprintf(b, sizeof b, "Text size    < %dx%d, %dx%d cells >", cw, ch, cols, rows); put(5, 1, b, 0);
+    snprintf(b, sizeof b, "Brightness   < %d%% >", BRIGHT[bright_idx]); put(6, 1, b, 0);
+    put(7, 1, "Close", 0);
     rowattr(2 + menu_sel, ATTR_REVERSE);
     footer(" Up Down move   Left Right change   Enter select   GUI closes");
 }
@@ -911,7 +912,7 @@ static bool follow_link(int li) {
 }
 
 // ---------- browser ----------
-typedef struct { char name[64]; bool dir, pack, all, hub, files; long size; } ent_t;
+typedef struct { char name[64]; bool dir, pack, all, hub, files, term, loader; long size; } ent_t;
 static const char *(*files_handler)(void);
 void reader_set_files_handler(const char *(*h)(void)) { files_handler = h; }
 static bool doc_from_files;   // the document on screen came from the file manager, closing it goes back there
@@ -924,6 +925,8 @@ static int ent_cmp(const void *a, const void *b) {
     const ent_t *x = a, *y = b;
     if (x->all != y->all) return x->all ? -1 : 1;
     if (x->files != y->files) return x->files ? -1 : 1;   // Files comes right under Search
+    if (x->term != y->term) return x->term ? -1 : 1;     // and the way back to the terminal right under Files
+    if (x->loader != y->loader) return x->loader ? -1 : 1;
     if (x->hub != y->hub) return x->hub ? -1 : 1;
     if (x->dir != y->dir) return x->dir ? -1 : 1;
     return strcasecmp(x->name, y->name);
@@ -935,9 +938,9 @@ static void browse(const char *dir) {
     nents = 0;
     bsel = 0;
     DIR *d = opendir(dir);
-    if (!d) return;
+    if (!d && strcmp(dir, LIB)) return;   // the top of the library still gets its own rows when there is no card, or it cannot be read
     struct dirent *e;
-    while ((e = readdir(d)) && nents < MAX_ENT) {
+    while (d && (e = readdir(d)) && nents < MAX_ENT) {
         if (e->d_name[0] == '.') continue;
         char p[400];
         snprintf(p, sizeof p, "%.255s/%.100s", dir, e->d_name);
@@ -961,7 +964,7 @@ static void browse(const char *dir) {
         }
         nents++;
     }
-    closedir(d);
+    if (d) closedir(d);
     if (!strcmp(dir, LIB)) {
         scan_packs();
         int searchable = 0;
@@ -983,7 +986,19 @@ static void browse(const char *dir) {
             ents[nents].dir = true; ents[nents].all = true;
             nents++;
         }
-        if (files_handler && nents < MAX_ENT) {
+        if (nents < MAX_ENT) {   // the loader and the terminal are always there, they work without a card
+            memset(&ents[nents], 0, sizeof(ent_t));
+            snprintf(ents[nents].name, sizeof ents[nents].name, "Open the loader (restarts)");
+            ents[nents].dir = true; ents[nents].loader = true;
+            nents++;
+        }
+        if (nents < MAX_ENT) {
+            memset(&ents[nents], 0, sizeof(ent_t));
+            snprintf(ents[nents].name, sizeof ents[nents].name, "Back to the terminal (restarts)");
+            ents[nents].dir = true; ents[nents].term = true;
+            nents++;
+        }
+        if (files_handler && sdcard_ok() && nents < MAX_ENT) {   // Files only when there is a card to look at
             memset(&ents[nents], 0, sizeof(ent_t));
             snprintf(ents[nents].name, sizeof ents[nents].name, "Files, pictures, sounds and the whole card");
             ents[nents].dir = true; ents[nents].files = true;
@@ -1015,13 +1030,14 @@ static void draw_browse(void) {
     fix_top(bsel, &btop, visible, nents);
     int top = btop;
     display_set_scrollbar(top, visible, nents);
-    if (!sdcard_ok()) put_flow(2, 1, "No SD card, or it is not FAT32.", 0);
+    if (!sdcard_ok()) put_flow(2, 1, "No card, or it could not be read. FAT32 and exFAT cards work.", 0);
     else if (nents == 0) { int r = put_flow(2, 1, "No library on this card yet.", ATTR_BOLD); put_flow(r + 1, 1, "Copy the library folder onto the card from a computer, or send it over Wi-Fi from Mode 1. GUI opens the menu.", 0); }
     for (int i = 0; i < visible && top + i < nents; i++) {
         ent_t *x = &ents[top + i];
         if (x->hub) snprintf(b, sizeof b, " [topics] %.200s", x->name);
         else if (x->all) snprintf(b, sizeof b, " [search] %.200s", x->name);
         else if (x->files) snprintf(b, sizeof b, " [files]  %.200s", x->name);
+        else if (x->term || x->loader) snprintf(b, sizeof b, " [exit]   %.200s", x->name);
         else if (x->pack) snprintf(b, sizeof b, " [pack] %.200s", x->name);
         else if (x->dir) snprintf(b, sizeof b, " [dir]  %.200s", x->name);
         else snprintf(b, sizeof b, " %.200s  (%ld KB)", x->name, (x->size + 1023) / 1024);
@@ -1437,6 +1453,8 @@ static void open_entry(int i) {
         }
         return;
     }
+    if (x->term) { quit_app = APP_BACK; return; }
+    if (x->loader) { to_loader(); return; }
     if (x->files && files_handler) { run_files_row(); return; }
     if (x->all) { search_all = true; text_mode = true; query[0] = 0; qcur = 0; nres = 0; rsel = 0; results_fresh = false; state = ST_SEARCH; }
     else if (x->pack) {
@@ -1491,15 +1509,15 @@ static void menu_toggle(void) {
     state = ST_MENU;
 }
 static void key_menu(uint16_t code) {
-    if (code == HID_UP) menu_sel = menu_sel > 0 ? menu_sel - 1 : 4;       // wraps round
-    else if (code == HID_DOWN) menu_sel = menu_sel < 4 ? menu_sel + 1 : 0;
+    if (code == HID_UP) menu_sel = menu_sel > 0 ? menu_sel - 1 : 5;       // wraps round
+    else if (code == HID_DOWN) menu_sel = menu_sel < 5 ? menu_sel + 1 : 0;
     else if (code == HID_LEFT || code == HID_RIGHT) {
         int d = code == HID_RIGHT ? 1 : -1;
-        if (menu_sel == 1) apply_theme(theme_idx + d);
-        else if (menu_sel == 2) { apply_font(font_idx + d); if (dnrows || dn) doc_wrap(); }
-        else if (menu_sel == 3) apply_brightness(bright_idx + d);
+        if (menu_sel == 2) apply_theme(theme_idx + d);
+        else if (menu_sel == 3) { apply_font(font_idx + d); if (dnrows || dn) doc_wrap(); }
+        else if (menu_sel == 4) apply_brightness(bright_idx + d);
     }
-    else if (code == HID_ENTER) { if (menu_sel == 0) quit_app = APP_BACK; else if (menu_sel == 4) state = menu_back; }
+    else if (code == HID_ENTER) { if (menu_sel == 0) quit_app = APP_BACK; else if (menu_sel == 1) to_loader(); else if (menu_sel == 5) state = menu_back; }
     else if (code == HID_ESC) state = menu_back;
 }
 
@@ -1715,6 +1733,12 @@ app_exit_t reader_app(QueueHandle_t q, QueueHandle_t tq) {
         static int64_t last_draw;
         if (sel_clear_at && esp_timer_get_time() > sel_clear_at) { sel_clear_at = 0; sel_a = sel_b = -1; last_tap_text[0] = 0; changed = true; }
         if (quit_app) break;
+        {   // no card, or one that could not be read, while the library list shows: look again now and then, so putting a good card in just works
+            static int64_t last_look;
+            int64_t tn = esp_timer_get_time();
+            if (state == ST_BROWSE && !strcmp(cwd, LIB) && !sdcard_ok() && tn - last_look > 3000000 && sdcard_async_state() == 0) { last_look = tn; sdcard_mount_async(); }
+            if (sdcard_async_state() >= 2) { bool found = sdcard_async_state() == 2; sdcard_async_ack(); if (found && state == ST_BROWSE) { browse(cwd); changed = true; } }
+        }
         if (changed || esp_timer_get_time() - last_draw > (marquee_on ? 200000 : 1000000)) { draw(); last_draw = esp_timer_get_time(); }
     }
     if (state == ST_IMAGE) { imgview_close(); state = ST_TEXT; }

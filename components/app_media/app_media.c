@@ -287,6 +287,7 @@ static esp_codec_dev_handle_t codec;
 static bool audio_ready;
 static volatile int play_cmd;       // 0 none, 1 stop, 2 pause toggle
 static volatile bool playing, paused, track_done;
+static volatile int seek_ms;    // a skip asked for while a sound plays, in milliseconds, negative goes back
 static volatile int vol = 10;   // starts quiet, and the level you choose is kept (loaded in media_app)
 static volatile uint32_t played_ms, total_ms;
 static int play_idx;
@@ -403,9 +404,19 @@ static void play_wav(FILE *f) {
     static uint8_t raw[FR * 8];
     static int16_t buf[FR * 2];
     uint64_t frames_done = 0, left = unknown_len ? UINT64_MAX : data_len;
+    long data_start = ftell(f);
     int last_vol = -1;
+    seek_ms = 0;
     while (left >= (uint64_t)bpf) {
         if (wait_if_paused()) break;
+        if (seek_ms) {   // skip: the file is plain samples, so it is a jump to the right byte
+            int64_t nf = (int64_t)frames_done + (int64_t)seek_ms * rate / 1000;
+            int64_t tot = unknown_len ? INT64_MAX : (int64_t)(data_len / (uint32_t)bpf);
+            seek_ms = 0;
+            if (nf < 0) nf = 0;
+            if (nf >= tot) break;   // past the end
+            if (fseek(f, data_start + (long)nf * bpf, SEEK_SET) == 0) { frames_done = (uint64_t)nf; if (!unknown_len) left = data_len - (uint64_t)nf * (uint64_t)bpf; played_ms = (uint32_t)(frames_done * 1000 / (uint32_t)rate); }
+        }
         if (vol != last_vol) { esp_codec_dev_set_out_vol(codec, vol); last_vol = vol; }   // only when it was changed
         size_t want = FR;
         if ((uint64_t)want * (uint64_t)bpf > left) want = (size_t)(left / (uint64_t)bpf);
@@ -441,8 +452,24 @@ static void play_mp3(FILE *f) {
     uint64_t frames_done = 0;
     long bytes_read = 0;
     int bitrate_kbps = 0;
+    seek_ms = 0;
     for (;;) {
         if (wait_if_paused()) break;
+        if (seek_ms && opened && bitrate_kbps > 0) {   // skip: by the bit rate, so it lands close to where it should and the decoder finds the next frame on its own
+            long here = bytes_read - have;
+            long to = here + (long)((int64_t)seek_ms * bitrate_kbps / 8);
+            int64_t dframes = (int64_t)seek_ms * rate / 1000;
+            seek_ms = 0;
+            if (to < 0) to = 0;
+            if (to >= fsize) break;   // past the end
+            if (fseek(f, to, SEEK_SET) == 0) {
+                bytes_read = to; have = 0; eof = false;
+                mp3dec_init(dec);
+                int64_t nf = (int64_t)frames_done + dframes;
+                frames_done = nf < 0 ? 0 : (uint64_t)nf;
+                played_ms = (uint32_t)(frames_done * 1000 / (uint32_t)rate);
+            }
+        }
         if (have < 8192 && !eof) { size_t n = fread(in + have, 1, 16384 - (size_t)have, f); if (!n) eof = true; have += (int)n; bytes_read += (long)n; }
         if (have == 0) break;
         mp3dec_frame_info_t info;
@@ -515,7 +542,7 @@ static void draw_browse(void) {
     fix_top(bsel, &btop, visible, nents);
     int top = btop;
     display_set_scrollbar(top, visible, nents);
-    if (!sdcard_ok()) put_flow(2, 1, "No SD card, or it is not FAT32.", 0);
+    if (!sdcard_ok()) put_flow(2, 1, "No card, or it could not be read. FAT32 and exFAT cards work.", 0);
     else if (nents == 0) { int r = put_flow(2, 1, "Nothing here yet.", ATTR_BOLD); put_flow(r + 1, 1, "Put JPEG pictures, WAV and MP3 files in the media folder on the SD card. tools/a11convert.py makes them from other files. GUI opens the menu.", 0); }
     for (int i = 0; i < visible && top + i < nents; i++) {
         ent_t *x = &ents[top + i];
@@ -548,7 +575,7 @@ static void draw_play(void) {
     put(6, 2, bar, 0);
     snprintf(b, sizeof b, "Volume %d%%", vol);
     put(8, 2, b, 0);
-    footer("Space pause   Left Right track   Up Down volume   Esc stop");
+    footer("Space pause   Left Right skip 10 s, Shift a minute   Up Down volume   Esc stop");
 }
 static void draw_msg(void) {
     clear();
@@ -657,8 +684,8 @@ static void handle_key(a11_event_t ev) {
             else if (code == HID_SPACE) play_cmd = 2;
             else if (code == HID_UP) { vol = vol + 5 > VOL_CAP ? VOL_CAP : vol + 5; settings_set("mvol", vol); }
             else if (code == HID_DOWN) { vol = vol < 5 ? 0 : vol - 5; settings_set("mvol", vol); }
-            else if (code == HID_RIGHT) { int n = next_track(play_idx, 1); if (n != play_idx) play_start(n); }
-            else if (code == HID_LEFT) { int n = next_track(play_idx, -1); if (n != play_idx) play_start(n); }
+            else if (code == HID_RIGHT) seek_ms = shift ? 60000 : 10000;    // the arrows skip, 10 seconds, or a minute with Shift
+            else if (code == HID_LEFT) seek_ms = shift ? -60000 : -10000;
             break;
         case ST_MSG: state = msg_back; break;
     }

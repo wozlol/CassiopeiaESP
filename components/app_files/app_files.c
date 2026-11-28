@@ -9,6 +9,7 @@
 #include "a11_keys.h"
 #include "app_files.h"
 #include "app_imgview.h"
+#include "app_switch.h"
 #include "board.h"
 #include "display.h"
 #include "esp_heap_caps.h"
@@ -59,6 +60,7 @@ static int last_foot_n = 1;
 static char pending_doc[400];
 const char *files_take_doc(void) { static char out[400]; if (!pending_doc[0]) return NULL; snprintf(out, sizeof out, "%s", pending_doc); pending_doc[0] = 0; return out; }
 static bool ejected_hold(void);
+static int nc_sel;     // the choice on the no card screen
 static bool ejected;   // the card was let go on purpose, the screen says it can be taken out
 static void (*sound_handler)(const char *path);
 void files_set_sound_handler(void (*h)(const char *path)) { sound_handler = h; }
@@ -394,8 +396,16 @@ static void draw_screen(void) {
     }
     if (state == ST_NOCARD) {
         header("Files");
-        put_flow(2, 1, ejected ? "The card is safe to take out. Put a card in and it opens by itself." : "No card. Put a card in and it opens by itself.", ATTR_BOLD);
-        footer("Esc goes back");
+        put_flow(2, 1, ejected ? "The card is safe to take out. Put a card in and press Enter." : sdcard_problem() == 2 ? "This card could not be read. It works with FAT32 and exFAT cards, and this one may be another kind, or damaged. Put another card in, or go back." : "No card. Put a card in and it opens by itself.", ATTR_BOLD);
+        int r = 5;
+        static const char *const OPT[] = {"Look for the card again", "Back", "Back to the terminal (restarts)", "Open the loader (restarts)"};
+        int nopt = sound_handler ? 4 : 3;   // the terminal needs a restart only from the Library
+        for (int i = 0; i < nopt; i++) {
+            const char *label = (i == 2 && !sound_handler) ? OPT[3] : OPT[i];
+            put(r + i, 2, label, 0);
+            if (i == nc_sel) rowattr(r + i, ATTR_REVERSE);
+        }
+        footer("Up Down move   Enter chooses   Esc or GUI goes back");
         return;
     }
     if (state == ST_MSG) {
@@ -411,7 +421,7 @@ static void draw_screen(void) {
     int visible = rows - 1 - last_foot_n;
     fix_top(bsel, &btop, visible, nents);
     display_set_scrollbar(btop, visible, nents);
-    if (!sdcard_ok()) put_flow(2, 1, "No SD card, or it is not FAT32.", 0);
+    if (!sdcard_ok()) put_flow(2, 1, "No card, or it could not be read. FAT32 and exFAT cards work.", 0);
     else if (nents == 0) put_flow(2, 1, "Nothing here.", ATTR_BOLD);
     for (int i = 0; i < visible && btop + i < nents; i++) {
         ent_t *x = &ents[btop + i];
@@ -464,7 +474,7 @@ static void key_list(uint16_t code) {
         quit_app = APP_BACK;   // the reader shows it and comes back here when it is closed
     }
     else if (code == HID_ENTER && nents) msg_show("%s is not a kind of file this can open.", ents[bsel].name);
-    else if (c == 'e') { ejected = true; sdcard_unmount(); state = ST_NOCARD; }   // lets go of the card so it can be taken out safely
+    else if (c == 'e') { ejected = true; sdcard_unmount(); nc_sel = 0; state = ST_NOCARD; }   // lets go of the card so it can be taken out safely
     else if (code == HID_ESC || code == HID_BACKSPACE) go_up();
     else if (c == 'd' && nents) {
         snprintf(del_name, sizeof del_name, "%s", ents[bsel].name);
@@ -525,7 +535,20 @@ static void handle_key(a11_event_t ev) {
         case ST_LIST: key_list(code); break;
         case ST_NEWDIR: key_newdir(code); break;
         case ST_MSG: state = ST_LIST; break;
-        case ST_NOCARD: if (code == HID_ESC) quit_app = APP_BACK; break;
+        case ST_NOCARD: {
+            int nopt = sound_handler ? 4 : 3;
+            if (code == HID_ESC) quit_app = APP_BACK;
+            else if (code == HID_UP) nc_sel = nc_sel > 0 ? nc_sel - 1 : nopt - 1;
+            else if (code == HID_DOWN) nc_sel = nc_sel + 1 < nopt ? nc_sel + 1 : 0;
+            else if (code == HID_ENTER) {
+                int pick = (!sound_handler && nc_sel == 2) ? 3 : nc_sel;   // without the Library the third row is the loader
+                if (pick == 0) { ejected = false; sdcard_mount_async(); }     // look again now
+                else if (pick == 1) quit_app = APP_BACK;
+                else if (pick == 2) { if (!app_switch("mode1")) quit_app = APP_BACK; }
+                else to_loader();
+            }
+            break;
+        }
         case ST_THUMBS: {
             char tc = a11_hid_to_char(code, shift, false);
             if (code == HID_LEFT && tsel > 0) tsel--;
@@ -595,7 +618,7 @@ static void handle_touch(touch_event_t te) {
     }
 }
 
-static bool ejected_hold(void) { return false; }   // a card put in after an eject opens on its own, taking it out and putting it back is the same thing
+static bool ejected_hold(void) { return ejected; }   // after an eject nothing is mounted again until a key is pressed, so the card can be taken out safely
 app_exit_t files_app(QueueHandle_t q, QueueHandle_t tq) {
     quit_app = APP_NONE;
     shift = ctrl = alt = gui = gui_tap = false;
@@ -619,11 +642,12 @@ app_exit_t files_app(QueueHandle_t q, QueueHandle_t tq) {
         if (xQueueReceive(q, &ev, pdMS_TO_TICKS(40)) == pdTRUE) { handle_key(ev); changed = true; }
         if (quit_app) break;
         int64_t now = esp_timer_get_time();
-        static int64_t last_probe;
+        static int64_t last_probe, last_try;
         if (now - last_probe > 1200000) {   // a card taken out, or a card put in
             last_probe = now;
-            if (state != ST_NOCARD && !sdcard_present()) { if (state == ST_PICTURE) imgview_close(); sdcard_unmount(); ejected = false; state = ST_NOCARD; cut_path[0] = 0; changed = true; }
-            else if (state == ST_NOCARD && !ejected_hold() && sdcard_mount()) { snprintf(cwd, sizeof cwd, "%s", ROOT); browse(cwd); state = ST_LIST; ejected = false; changed = true; }
+            if (state != ST_NOCARD && !sdcard_present()) { if (state == ST_PICTURE) imgview_close(); sdcard_unmount(); ejected = false; nc_sel = 0; state = ST_NOCARD; cut_path[0] = 0; changed = true; }
+            else if (state == ST_NOCARD && !ejected_hold() && (sdcard_problem() != 2 || now - last_try > 8000000) && sdcard_async_state() == 0) { last_try = now; sdcard_mount_async(); }
+            if (sdcard_async_state() >= 2) { bool found = sdcard_async_state() == 2; sdcard_async_ack(); if (found && state == ST_NOCARD) { snprintf(cwd, sizeof cwd, "%s", ROOT); browse(cwd); state = ST_LIST; ejected = false; changed = true; } else if (found) { /* mounted while the list was showing: nothing to do */ } changed = true; }
         }
         if (state == ST_THUMBS) {
             if (changed) thumbs_draw();

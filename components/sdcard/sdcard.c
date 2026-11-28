@@ -4,6 +4,8 @@
 #include <strings.h>
 #include "board.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <sys/stat.h>
 #include <stdio.h>
 #include "esp_vfs_fat.h"
@@ -13,6 +15,8 @@
 static const char *TAG = "sdcard";
 static sdmmc_card_t *card;
 static bool ok;
+static int problem;
+int sdcard_problem(void) { return problem; }
 
 bool sdcard_ok(void) { return ok; }
 
@@ -26,6 +30,7 @@ bool sdcard_mount(void) {
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
     esp_err_t e = esp_vfs_fat_sdmmc_mount(SDCARD_MOUNT, &host, &slot, &mc, &card);
     ok = e == ESP_OK;
+    problem = ok ? 0 : (e == ESP_FAIL ? 2 : 1);   // the card answered but the file system would not mount, or there is no card
     if (ok) {   // our four folders are made on a card that is empty or already ours. A card from somewhere else is left exactly as it is.
         static const char *const DIRS[] = {"library", "media", "modes", "downloads"};
         int entries = 0; bool ours = false;
@@ -52,3 +57,13 @@ void sdcard_unmount(void) {
     ok = false;
 }
 uint32_t sdcard_serial(void) { return ok && card ? card->cid.serial : 0; }
+
+static volatile int astate;
+static void mount_task(void *arg) { bool r = sdcard_mount(); astate = r ? 2 : 3; vTaskDelete(NULL); }
+void sdcard_mount_async(void) {
+    if (astate != 0) return;
+    astate = 1;
+    if (xTaskCreate(mount_task, "sdmount", 4096, NULL, 4, NULL) != pdPASS) astate = 3;
+}
+int sdcard_async_state(void) { return astate; }
+void sdcard_async_ack(void) { if (astate >= 2) astate = 0; }
