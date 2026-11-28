@@ -188,7 +188,7 @@ static void draw_menu(void) {
     int cw, ch;
     display_cell_size(&cw, &ch);
     char b[100];
-    put(2, 1, "Back to the list", 0);
+    put(2, 1, "Back to the terminal (restarts)", 0);
     snprintf(b, sizeof b, "Theme        < %s >", themes_get(theme_idx)->name); put(3, 1, b, 0);
     snprintf(b, sizeof b, "Text size    < %dx%d, %dx%d cells >", cw, ch, cols, rows); put(4, 1, b, 0);
     snprintf(b, sizeof b, "Brightness   < %d%% >", BRIGHT[bright_idx]); put(5, 1, b, 0);
@@ -911,7 +911,11 @@ static bool follow_link(int li) {
 }
 
 // ---------- browser ----------
-typedef struct { char name[64]; bool dir, pack, all, hub; long size; } ent_t;
+typedef struct { char name[64]; bool dir, pack, all, hub, files; long size; } ent_t;
+static const char *(*files_handler)(void);
+void reader_set_files_handler(const char *(*h)(void)) { files_handler = h; }
+static bool doc_from_files;   // the document on screen came from the file manager, closing it goes back there
+static void run_files_row(void);
 static ent_t *ents;
 static int nents, bsel;
 static char cwd[256] = LIB;
@@ -919,6 +923,7 @@ static char cwd[256] = LIB;
 static int ent_cmp(const void *a, const void *b) {
     const ent_t *x = a, *y = b;
     if (x->all != y->all) return x->all ? -1 : 1;
+    if (x->files != y->files) return x->files ? -1 : 1;   // Files comes right under Search
     if (x->hub != y->hub) return x->hub ? -1 : 1;
     if (x->dir != y->dir) return x->dir ? -1 : 1;
     return strcasecmp(x->name, y->name);
@@ -978,11 +983,17 @@ static void browse(const char *dir) {
             ents[nents].dir = true; ents[nents].all = true;
             nents++;
         }
+        if (files_handler && nents < MAX_ENT) {
+            memset(&ents[nents], 0, sizeof(ent_t));
+            snprintf(ents[nents].name, sizeof ents[nents].name, "Files, pictures, sounds and the whole card");
+            ents[nents].dir = true; ents[nents].files = true;
+            nents++;
+        }
     }
     qsort(ents, nents, sizeof(ent_t), ent_cmp);
 }
 static void go_up(void) {
-    if (!strcmp(cwd, LIB)) { quit_app = APP_BACK; return; }   // Esc at the top of the library leaves the reader
+    if (!strcmp(cwd, LIB)) return;   // the top of the library, only the menu leaves to the terminal
     char *s = strrchr(cwd, '/');
     if (s && s > cwd) { *s = 0; browse(cwd); }
 }
@@ -1010,6 +1021,7 @@ static void draw_browse(void) {
         ent_t *x = &ents[top + i];
         if (x->hub) snprintf(b, sizeof b, " [topics] %.200s", x->name);
         else if (x->all) snprintf(b, sizeof b, " [search] %.200s", x->name);
+        else if (x->files) snprintf(b, sizeof b, " [files]  %.200s", x->name);
         else if (x->pack) snprintf(b, sizeof b, " [pack] %.200s", x->name);
         else if (x->dir) snprintf(b, sizeof b, " [dir]  %.200s", x->name);
         else snprintf(b, sizeof b, " %.200s  (%ld KB)", x->name, (x->size + 1023) / 1024);
@@ -1325,7 +1337,7 @@ static void key_text(uint16_t code) {
     else if (code == HID_ESC) {
         if (doc_article && !hub_mode) state = ST_SEARCH;
         else state = ST_BROWSE;
-        if (state == ST_BROWSE) { doc_free(); hub_mode = false; }
+        if (state == ST_BROWSE) { doc_free(); hub_mode = false; if (doc_from_files) { doc_from_files = false; run_files_row(); } }
     }
     else if (c == 't') apply_theme(theme_idx + 1);
 }
@@ -1425,6 +1437,7 @@ static void open_entry(int i) {
         }
         return;
     }
+    if (x->files && files_handler) { run_files_row(); return; }
     if (x->all) { search_all = true; text_mode = true; query[0] = 0; qcur = 0; nres = 0; rsel = 0; results_fresh = false; state = ST_SEARCH; }
     else if (x->pack) {
         int pi = -1;
@@ -1435,6 +1448,23 @@ static void open_entry(int i) {
     } else if (x->dir) browse(p);
     else if (doc_open_file(p, x->name)) state = ST_TEXT;
     else msg_show(ST_BROWSE, "Could not open that file.");
+}
+// The file manager runs, and when it returns the list comes back, or the document it asked for opens and closing that goes back to the file manager.
+static void run_files_row(void) {
+    const char *doc = files_handler();
+    char path[400] = "";
+    if (doc) snprintf(path, sizeof path, "%s", doc);
+    font_idx = settings_get("font", font_idx);
+    display_set_font(font_idx, &cols, &rows);
+    scr_alloc();
+    pack_close();   // another card may be in now
+    state = ST_BROWSE;
+    browse(cwd);
+    if (path[0]) {
+        const char *base = strrchr(path, '/');
+        if (doc_open_file(path, base ? base + 1 : path)) { state = ST_TEXT; doc_from_files = true; }
+        else msg_show(ST_BROWSE, "Could not open that file.");
+    }
 }
 static void key_browse(uint16_t code) {
     if (alt && code == HID_UP) code = HID_PGUP;   // Alt+Up and Alt+Down are Page Up and Page Down
@@ -1673,7 +1703,6 @@ app_exit_t reader_app(QueueHandle_t q, QueueHandle_t tq) {
     display_set_font(font_idx, &cols, &rows);
     scr_alloc();
     sdcard_mount();
-    mkdir(LIB, 0777);
     if (state == ST_BROWSE || state == ST_MENU) { state = ST_BROWSE; browse(cwd[0] ? cwd : LIB); }
     ESP_LOGI(TAG, "reader ready, %d entries", nents);
     while (!quit_app) {

@@ -1,1 +1,1 @@
-idf_component_register(SRCS "library.c" INCLUDE_DIRS "." PRIV_REQUIRES esp_app_format status_led app_reader app_media app_files app_common launcher_guard display a11_keys touch prefs sdcard board clipboard joltwallet__littlefs esp_timer esp_system)
+idf_component_register(SRCS "library.c" INCLUDE_DIRS "." PRIV_REQUIRES status_led app_reader app_media app_files app_common launcher_guard display a11_keys touch prefs sdcard board clipboard joltwallet__littlefs esp_timer esp_system)

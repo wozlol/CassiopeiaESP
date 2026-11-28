@@ -195,6 +195,8 @@ static state_t menu_back = ST_BROWSE;
 static bool gui_tap;
 static void to_loader(void);
 static app_exit_t quit_app;   // set when the person leaves, the loop in media_app then returns
+static bool single;           // started on one file by the file manager: leaving it leaves the viewer
+static char start_name[100];  // that file
 static void draw_menu(void) {
     display_set_scrollbar(0, 0, 0);
     clear();
@@ -285,7 +287,7 @@ static esp_codec_dev_handle_t codec;
 static bool audio_ready;
 static volatile int play_cmd;       // 0 none, 1 stop, 2 pause toggle
 static volatile bool playing, paused, track_done;
-static volatile int vol = 55;
+static volatile int vol = 10;   // starts quiet, and the level you choose is kept (loaded in media_app)
 static volatile uint32_t played_ms, total_ms;
 static int play_idx;
 static TaskHandle_t play_task;
@@ -440,7 +442,7 @@ static bool play_start(int idx) {
     play_stop();
     if (!audio_init()) return false;
     play_idx = idx; play_cmd = 0; playing = true; paused = false; track_done = false;
-    return xTaskCreate(play_task_fn, "play", 12288, NULL, 5, &play_task) == pdPASS;
+    return xTaskCreate(play_task_fn, "play", 28672, NULL, 5, &play_task) == pdPASS;
 }
 static int next_track(int from, int dir) {
     for (int i = from + dir; i >= 0 && i < nents; i += dir) if (ents[i].kind == 2) return i;
@@ -523,7 +525,7 @@ static void draw(void) {
 }
 
 // ---------- keys ----------
-static void leave_picture(void) { imgview_close(); state = ST_BROWSE; }
+static void leave_picture(void) { imgview_close(); state = ST_BROWSE; if (single) quit_app = APP_BACK; }
 static void open_entry(int i) {
     if (i < 0 || i >= nents) return;
     ent_t *x = &ents[i];
@@ -597,10 +599,10 @@ static void handle_key(a11_event_t ev) {
             break;
         }
         case ST_PLAY:
-            if (code == HID_ESC || code == HID_BACKSPACE) { play_stop(); state = ST_BROWSE; }
+            if (code == HID_ESC || code == HID_BACKSPACE) { play_stop(); state = ST_BROWSE; if (single) quit_app = APP_BACK; }
             else if (code == HID_SPACE) play_cmd = 2;
-            else if (code == HID_UP) vol = vol + 5 > VOL_CAP ? VOL_CAP : vol + 5;
-            else if (code == HID_DOWN) vol = vol < 5 ? 0 : vol - 5;
+            else if (code == HID_UP) { vol = vol + 5 > VOL_CAP ? VOL_CAP : vol + 5; settings_set("mvol", vol); }
+            else if (code == HID_DOWN) { vol = vol < 5 ? 0 : vol - 5; settings_set("mvol", vol); }
             else if (code == HID_RIGHT) { int n = next_track(play_idx, 1); if (n != play_idx) play_start(n); }
             else if (code == HID_LEFT) { int n = next_track(play_idx, -1); if (n != play_idx) play_start(n); }
             break;
@@ -640,6 +642,9 @@ static void handle_touch(touch_event_t te) {
 
 app_exit_t media_app(QueueHandle_t q, QueueHandle_t tq) {
     quit_app = APP_NONE;
+    vol = settings_get("mvol", 10);
+    if (vol < 0) vol = 0;
+    if (vol > VOL_CAP) vol = VOL_CAP;
     shift = ctrl = alt = gui = false;
     gui_tap = false;
     font_idx = settings_get("font", 0);
@@ -651,10 +656,10 @@ app_exit_t media_app(QueueHandle_t q, QueueHandle_t tq) {
     display_set_font(font_idx, &cols, &rows);
     scr_alloc();
     sdcard_mount();
-    mkdir(ROOT, 0777);
     state = ST_BROWSE;
     browse(cwd[0] ? cwd : ROOT);
     ESP_LOGI(TAG, "media ready, %d entries", nents);
+    if (single) for (int i = 0; i < nents; i++) if (!strcmp(ents[i].name, start_name)) { open_entry(i); break; }
     int64_t last_draw = 0;
     while (!quit_app) {
         a11_event_t ev;
@@ -665,8 +670,9 @@ app_exit_t media_app(QueueHandle_t q, QueueHandle_t tq) {
         if (quit_app) break;
         if (track_done && state == ST_PLAY) {   // next track of the folder, or stop at the end
             track_done = false;
-            int n = next_track(play_idx, 1);
-            if (n != play_idx && play_start(n)) changed = true; else { state = ST_BROWSE; changed = true; }
+            int n = single ? play_idx : next_track(play_idx, 1);
+            if (single) { state = ST_BROWSE; quit_app = APP_BACK; changed = true; }
+            else if (n != play_idx && play_start(n)) changed = true; else { state = ST_BROWSE; changed = true; }
         }
         int64_t now = esp_timer_get_time();
         if ((changed || (state == ST_PLAY && now - last_draw > 500000) || (marquee_on && now - last_draw > 200000)) && state != ST_PICTURE) { draw(); last_draw = now; }
@@ -676,4 +682,16 @@ app_exit_t media_app(QueueHandle_t q, QueueHandle_t tq) {
     free(scr); free(back_buf);
     scr = back_buf = NULL;
     return quit_app;
+}
+
+app_exit_t media_app_file(QueueHandle_t q, QueueHandle_t tq, const char *path) {
+    const char *slash = strrchr(path, '/');
+    if (!slash) return APP_BACK;
+    snprintf(cwd, sizeof cwd, "%.*s", (int)(slash - path) < 255 ? (int)(slash - path) : 255, path);
+    snprintf(start_name, sizeof start_name, "%.99s", slash + 1);
+    single = true;
+    app_exit_t r = media_app(q, tq);
+    single = false;
+    cwd[0] = 0;   // the next normal start begins at the top of the media folder again
+    return r;
 }

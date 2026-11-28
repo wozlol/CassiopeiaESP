@@ -363,7 +363,7 @@ static void draw_menu(void) {
     items[M_BATT] = "Battery and power";
     items[M_SEC] = "Security";
     items[M_STATUS] = "Status";
-    items[M_LIBRARY] = "Library, reader and media (restarts)";
+    items[M_LIBRARY] = "Library, reader and files (restarts)";
     items[M_FILES] = "Files";
     items[M_LOADER] = "Back to the loader";
     menu_items_now = items;

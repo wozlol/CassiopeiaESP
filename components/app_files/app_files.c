@@ -38,7 +38,7 @@
 #define HID_UP 82
 static const int BRIGHT[] = {10, 25, 40, 60, 80, 100};
 
-typedef enum { ST_LIST, ST_CONFIRM, ST_NEWDIR, ST_MSG, ST_PICTURE } state_t;
+typedef enum { ST_LIST, ST_CONFIRM, ST_NEWDIR, ST_MSG, ST_PICTURE, ST_NOCARD } state_t;
 static state_t state = ST_LIST;
 static char msg_text[200];
 static terminal_cell_t *scr, *back_buf;
@@ -56,6 +56,12 @@ static char del_path[400], del_name[64];
 static bool del_dir;
 static char nd_buf[48];
 static int last_foot_n = 1;
+static char pending_doc[400];
+const char *files_take_doc(void) { static char out[400]; if (!pending_doc[0]) return NULL; snprintf(out, sizeof out, "%s", pending_doc); pending_doc[0] = 0; return out; }
+static bool ejected_hold(void);
+static bool ejected;   // the card was let go on purpose, the screen says it can be taken out
+static void (*sound_handler)(const char *path);
+void files_set_sound_handler(void (*h)(const char *path)) { sound_handler = h; }
 static int pic_idx;   // the picture on screen, an index into ents
 
 static void scr_alloc(void) {
@@ -168,6 +174,17 @@ static bool is_jpeg(const char *n) {   // a picture the viewer can try: JPEG or 
     const char *e = strrchr(n, '.');
     return e && (!strcasecmp(e, ".jpg") || !strcasecmp(e, ".jpeg") || !strcasecmp(e, ".png"));
 }
+static bool is_sound(const char *n) {
+    const char *e = strrchr(n, '.');
+    return e && (!strcasecmp(e, ".wav") || !strcasecmp(e, ".mp3"));
+}
+static bool is_doc(const char *n) {   // plain text and the markup the reader can show
+    static const char *const EXT[] = {".txt", ".md", ".markdown", ".html", ".htm", ".text", ".log", ".csv", ".json", ".xml", ".ini", ".cfg", ".conf", ".yaml", ".yml", ".c", ".h", ".cpp", ".py", ".js", ".sh", ".tsv", ".srt", ".nfo", ".readme"};
+    const char *e = strrchr(n, '.');
+    if (!e) return false;
+    for (size_t i = 0; i < sizeof EXT / sizeof EXT[0]; i++) if (!strcasecmp(e, EXT[i])) return true;
+    return false;
+}
 static bool show_picture(int idx) {
     char p[400];
     snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[idx].name);
@@ -221,6 +238,12 @@ static void draw_screen(void) {
         footer("Enter makes it   Esc cancels");
         return;
     }
+    if (state == ST_NOCARD) {
+        header("Files");
+        put_flow(2, 1, ejected ? "The card is safe to take out. Put a card in and it opens by itself." : "No card. Put a card in and it opens by itself.", ATTR_BOLD);
+        footer("Esc goes back");
+        return;
+    }
     if (state == ST_MSG) {
         header("Files");
         put_flow(2, 1, msg_text, 0);
@@ -229,7 +252,7 @@ static void draw_screen(void) {
     }
     snprintf(b, sizeof b, "Files  %.200s", cwd + strlen(ROOT));
     header(b);
-    const char *hint = cut_path[0] ? "Enter open   d delete   p paste here   x cut again   n new folder   Esc up" : "Enter open   d delete   x cut   n new folder   Esc up   GUI back";
+    const char *hint = cut_path[0] ? "Enter open   d delete   p paste here   x cut again   n new folder   e eject   Esc up" : "Enter open   d delete   x cut   n new folder   e eject card   Esc up   GUI back";
     last_foot_n = foot_n_for(hint);
     int visible = rows - 1 - last_foot_n;
     fix_top(bsel, &btop, visible, nents);
@@ -273,7 +296,20 @@ static void key_list(uint16_t code) {
         state = ST_PICTURE;
         if (!show_picture(bsel)) { leave_picture(); msg_show("%s", imgview_error()); }
     }
-    else if (code == HID_ENTER && nents) msg_show("%s is not a picture. Open sounds in Media and documents in Reader.", ents[bsel].name);
+    else if (code == HID_ENTER && nents && is_sound(ents[bsel].name) && sound_handler) {
+        char p[400];
+        snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[bsel].name);
+        sound_handler(p);   // the player runs, and when it returns the file list comes back
+        font_idx = settings_get("font", font_idx);
+        display_set_font(font_idx, &cols, &rows);
+        scr_alloc();
+    }
+    else if (code == HID_ENTER && nents && is_doc(ents[bsel].name)) {
+        snprintf(pending_doc, sizeof pending_doc, "%.255s/%.100s", cwd, ents[bsel].name);
+        quit_app = APP_BACK;   // the reader shows it and comes back here when it is closed
+    }
+    else if (code == HID_ENTER && nents) msg_show("%s is not a kind of file this can open.", ents[bsel].name);
+    else if (c == 'e') { ejected = true; sdcard_unmount(); state = ST_NOCARD; }   // lets go of the card so it can be taken out safely
     else if (code == HID_ESC || code == HID_BACKSPACE) go_up();
     else if (c == 'd' && nents) {
         snprintf(del_name, sizeof del_name, "%s", ents[bsel].name);
@@ -334,6 +370,7 @@ static void handle_key(a11_event_t ev) {
         case ST_LIST: key_list(code); break;
         case ST_NEWDIR: key_newdir(code); break;
         case ST_MSG: state = ST_LIST; break;
+        case ST_NOCARD: if (code == HID_ESC) quit_app = APP_BACK; break;
         case ST_PICTURE: {
             iv_action_t act = imgview_key(code);
             if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; bsel = n; if (!show_picture(n)) { leave_picture(); msg_show("%s", imgview_error()); } } }
@@ -365,6 +402,7 @@ static void handle_touch(touch_event_t te) {
     }
 }
 
+static bool ejected_hold(void) { return false; }   // a card put in after an eject opens on its own, taking it out and putting it back is the same thing
 app_exit_t files_app(QueueHandle_t q, QueueHandle_t tq) {
     quit_app = APP_NONE;
     shift = ctrl = alt = gui = gui_tap = false;
@@ -388,6 +426,12 @@ app_exit_t files_app(QueueHandle_t q, QueueHandle_t tq) {
         if (xQueueReceive(q, &ev, pdMS_TO_TICKS(40)) == pdTRUE) { handle_key(ev); changed = true; }
         if (quit_app) break;
         int64_t now = esp_timer_get_time();
+        static int64_t last_probe;
+        if (now - last_probe > 1200000) {   // a card taken out, or a card put in
+            last_probe = now;
+            if (state != ST_NOCARD && !sdcard_present()) { if (state == ST_PICTURE) imgview_close(); sdcard_unmount(); ejected = false; state = ST_NOCARD; cut_path[0] = 0; changed = true; }
+            else if (state == ST_NOCARD && !ejected_hold() && sdcard_mount()) { snprintf(cwd, sizeof cwd, "%s", ROOT); browse(cwd); state = ST_LIST; ejected = false; changed = true; }
+        }
         if (changed || now - last_draw > 1000000) { draw(); last_draw = now; }
     }
     if (state == ST_PICTURE) leave_picture();
