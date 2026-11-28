@@ -38,7 +38,7 @@
 #define HID_UP 82
 static const int BRIGHT[] = {10, 25, 40, 60, 80, 100};
 
-typedef enum { ST_LIST, ST_CONFIRM, ST_NEWDIR, ST_MSG, ST_PICTURE, ST_NOCARD } state_t;
+typedef enum { ST_LIST, ST_CONFIRM, ST_NEWDIR, ST_MSG, ST_PICTURE, ST_NOCARD, ST_THUMBS } state_t;
 static state_t state = ST_LIST;
 static char msg_text[200];
 static terminal_cell_t *scr, *back_buf;
@@ -62,7 +62,18 @@ static bool ejected_hold(void);
 static bool ejected;   // the card was let go on purpose, the screen says it can be taken out
 static void (*sound_handler)(const char *path);
 void files_set_sound_handler(void (*h)(const char *path)) { sound_handler = h; }
-static int pic_idx;   // the picture on screen, an index into ents
+static int pic_idx;
+// thumbnails: the pictures of the folder, 4 across, scrolled by dragging
+#define TCOLS 4
+#define TCW 120
+#define TCH 106
+#define TIW 116
+#define TIH 102
+#define TMAX_KEEP 96
+static int *tpics, ntp, tsel, toff;   // indices into ents, how many, the selected one, scroll offset in pixels
+static uint16_t **tthumb; static uint8_t *tfail;
+static uint16_t *tscreen;
+static bool from_thumbs;              // the picture on screen was opened from the thumbnails, closing it goes back to them   // the picture on screen, an index into ents
 
 static void scr_alloc(void) {
     free(scr); free(back_buf);
@@ -170,9 +181,9 @@ static void browse(const char *dir) {
     closedir(d);
     qsort(ents, nents, sizeof(ent_t), ent_cmp);
 }
-static bool is_jpeg(const char *n) {   // a picture the viewer can try: JPEG or PNG
+static bool is_jpeg(const char *n) {   // a picture the viewer can try: JPEG, PNG, BMP or GIF
     const char *e = strrchr(n, '.');
-    return e && (!strcasecmp(e, ".jpg") || !strcasecmp(e, ".jpeg") || !strcasecmp(e, ".png"));
+    return e && (!strcasecmp(e, ".jpg") || !strcasecmp(e, ".jpeg") || !strcasecmp(e, ".png") || !strcasecmp(e, ".bmp") || !strcasecmp(e, ".gif"));
 }
 static bool is_sound(const char *n) {
     const char *e = strrchr(n, '.');
@@ -186,6 +197,7 @@ static bool is_doc(const char *n) {   // plain text and the markup the reader ca
     return false;
 }
 static bool show_picture(int idx) {
+    free(tscreen); tscreen = NULL;   // the thumbnail frame is not needed while a picture is open
     char p[400];
     snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[idx].name);
     return imgview_file(p);
@@ -194,11 +206,112 @@ static int next_picture(int from, int dir) {
     for (int i = from + dir; i >= 0 && i < nents; i += dir) if (!ents[i].dir && is_jpeg(ents[i].name)) return i;
     return from;
 }
-static void leave_picture(void) { imgview_close(); state = ST_LIST; }
+static void thumbs_free(void) {
+    if (tthumb) for (int i = 0; i < ntp; i++) free(tthumb[i]);
+    free(tthumb); free(tfail); free(tpics); free(tscreen);
+    tthumb = NULL; tfail = NULL; tpics = NULL; tscreen = NULL; ntp = 0;
+}
+static void thumbs_scroll_to_sel(void) {
+    int row = tsel / TCOLS;
+    if (row * TCH < toff) toff = row * TCH;
+    if ((row + 1) * TCH > toff + 320) toff = (row + 1) * TCH - 320;
+    int maxoff = ((ntp + TCOLS - 1) / TCOLS) * TCH - 320;
+    if (toff > maxoff) toff = maxoff;
+    if (toff < 0) toff = 0;
+}
+static void leave_picture(void) {
+    imgview_close();
+    if (from_thumbs && ntp) {
+        for (int k = 0; k < ntp; k++) if (tpics[k] == pic_idx) tsel = k;
+        thumbs_scroll_to_sel();
+        state = ST_THUMBS;
+    } else state = ST_LIST;
+}
+static bool thumbs_enter(int from_idx) {
+    thumbs_free();
+    int cnt = 0;
+    for (int i = 0; i < nents; i++) if (!ents[i].dir && is_jpeg(ents[i].name)) cnt++;
+    if (cnt == 0) return false;
+    tpics = heap_caps_calloc((size_t)cnt, sizeof(int), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    tthumb = heap_caps_calloc((size_t)cnt, sizeof(uint16_t *), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    tfail = heap_caps_calloc((size_t)cnt, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tpics || !tthumb || !tfail) { thumbs_free(); return false; }
+    ntp = 0; tsel = 0;
+    for (int i = 0; i < nents; i++) if (!ents[i].dir && is_jpeg(ents[i].name)) { if (i == from_idx) tsel = ntp; tpics[ntp++] = i; }
+    toff = 0;
+    thumbs_scroll_to_sel();
+    display_set_scrollbar(0, 0, 0);
+    state = ST_THUMBS;
+    return true;
+}
+static void thumbs_leave(void) {
+    if (ntp) bsel = tpics[tsel];
+    thumbs_free();
+    display_raw(false);
+    state = ST_LIST;
+}
+// A folder that is mostly pictures opens as thumbnails by itself.
+static void auto_thumbs(void) {
+    int pics = 0;
+    for (int i = 0; i < nents; i++) if (!ents[i].dir && is_jpeg(ents[i].name)) pics++;
+    if (pics >= 4 && pics * 2 >= nents) thumbs_enter(-1);
+}
+static void thumbs_draw(void) {
+    if (!tscreen) tscreen = heap_caps_malloc((size_t)480 * 320 * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tscreen) return;
+    memset(tscreen, 0, (size_t)480 * 320 * 2);
+    for (int i = 0; i < ntp; i++) {
+        int cx = (i % TCOLS) * TCW, cy = (i / TCOLS) * TCH - toff;
+        if (cy + TCH <= 0 || cy >= 320) continue;
+        for (int y = 2; y < TCH - 2; y++) {
+            int sy = cy + y;
+            if (sy < 0 || sy >= 320) continue;
+            uint16_t *dst = tscreen + (size_t)sy * 480 + cx + 2;
+            if (tthumb[i]) { if (y - 2 < TIH) memcpy(dst, tthumb[i] + (size_t)(y - 2) * TIW, TIW * 2); }
+            else for (int x = 0; x < TIW; x++) dst[x] = tfail[i] ? 0x0000 : 0x0821;   // dark gray while it waits, black when it could not be made
+        }
+        if (i == tsel) {   // a white frame around the selected one
+            for (int x = 0; x < TCW; x++) for (int t = 0; t < 2; t++) {
+                int yt = cy + t, yb = cy + TCH - 1 - t;
+                if (yt >= 0 && yt < 320) tscreen[(size_t)yt * 480 + cx + x] = 0xFFFF;
+                if (yb >= 0 && yb < 320) tscreen[(size_t)yb * 480 + cx + x] = 0xFFFF;
+            }
+            for (int y = 0; y < TCH; y++) for (int t = 0; t < 2; t++) {
+                int sy = cy + y;
+                if (sy < 0 || sy >= 320) continue;
+                tscreen[(size_t)sy * 480 + cx + t] = 0xFFFF;
+                tscreen[(size_t)sy * 480 + cx + TCW - 1 - t] = 0xFFFF;
+            }
+        }
+    }
+    display_raw(true);
+    display_draw_pixels(0, 0, 480, 320, tscreen);
+}
+// Makes one thumbnail that is on screen and not made yet, the selected one first. True when it made one, so the screen is drawn again.
+static bool thumbs_step(void) {
+    int first = (toff / TCH) * TCOLS, last = ((toff + 319) / TCH + 1) * TCOLS;
+    if (last > ntp) last = ntp;
+    int pick = -1;
+    if (tsel >= first && tsel < last && !tthumb[tsel] && !tfail[tsel]) pick = tsel;
+    for (int i = first; pick < 0 && i < last; i++) if (!tthumb[i] && !tfail[i]) pick = i;
+    if (pick < 0) return false;
+    int made = 0;
+    for (int i = 0; i < ntp; i++) if (tthumb[i]) made++;
+    if (made >= TMAX_KEEP) {   // keep memory in check, the one furthest from the screen goes
+        int far = -1, fd = -1, mid = (first + last) / 2;
+        for (int i = 0; i < ntp; i++) if (tthumb[i] && abs(i - mid) > fd) { fd = abs(i - mid); far = i; }
+        if (far >= 0) { free(tthumb[far]); tthumb[far] = NULL; }
+    }
+    char p[400];
+    snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[tpics[pick]].name);
+    tthumb[pick] = imgview_thumb(p, TIW, TIH);
+    if (!tthumb[pick]) tfail[pick] = 1;
+    return true;
+}
 static void go_up(void) {
     if (!strcmp(cwd, ROOT)) { quit_app = APP_BACK; return; }   // Esc at the top of the card leaves the file manager
     char *s = strrchr(cwd, '/');
-    if (s && s > cwd) { *s = 0; browse(cwd); }
+    if (s && s > cwd) { *s = 0; browse(cwd); auto_thumbs(); }
 }
 static bool rm_tree(const char *path) {   // a file, or a folder with everything in it
     struct stat st;
@@ -252,7 +365,7 @@ static void draw_screen(void) {
     }
     snprintf(b, sizeof b, "Files  %.200s", cwd + strlen(ROOT));
     header(b);
-    const char *hint = cut_path[0] ? "Enter open   d delete   p paste here   x cut again   n new folder   e eject   Esc up" : "Enter open   d delete   x cut   n new folder   e eject card   Esc up   GUI back";
+    const char *hint = cut_path[0] ? "Enter open   d delete   p paste here   x cut again   n new folder   e eject   Esc up" : "Enter open   d delete   x cut   n new folder   v thumbnails   e eject card   Esc up   GUI back";
     last_foot_n = foot_n_for(hint);
     int visible = rows - 1 - last_foot_n;
     fix_top(bsel, &btop, visible, nents);
@@ -270,7 +383,7 @@ static void draw_screen(void) {
     footer(hint);
 }
 static void draw(void) {
-    if (!back_buf || state == ST_PICTURE) return;
+    if (!back_buf || state == ST_PICTURE || state == ST_THUMBS) return;
     terminal_cell_t *live = scr;
     scr = back_buf;
     draw_screen();
@@ -290,7 +403,8 @@ static void key_list(uint16_t code) {
     else if (code == HID_DOWN && bsel + 1 < nents) bsel++;
     else if (code == HID_PGUP) bsel = bsel > vis ? bsel - vis : 0;
     else if (code == HID_PGDN) bsel = bsel + vis < nents ? bsel + vis : (nents ? nents - 1 : 0);
-    else if (code == HID_ENTER && nents && ents[bsel].dir) { char p[400]; snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[bsel].name); browse(p); }
+    else if (code == HID_ENTER && nents && ents[bsel].dir) { char p[400]; snprintf(p, sizeof p, "%.255s/%.100s", cwd, ents[bsel].name); browse(p); auto_thumbs(); }
+    else if (c == 'v') thumbs_enter(nents ? bsel : -1);
     else if (code == HID_ENTER && nents && is_jpeg(ents[bsel].name)) {
         pic_idx = bsel;
         state = ST_PICTURE;
@@ -371,10 +485,27 @@ static void handle_key(a11_event_t ev) {
         case ST_NEWDIR: key_newdir(code); break;
         case ST_MSG: state = ST_LIST; break;
         case ST_NOCARD: if (code == HID_ESC) quit_app = APP_BACK; break;
+        case ST_THUMBS: {
+            char tc = a11_hid_to_char(code, shift, false);
+            if (code == HID_LEFT && tsel > 0) tsel--;
+            else if (code == HID_RIGHT && tsel + 1 < ntp) tsel++;
+            else if (code == HID_UP && tsel >= TCOLS) tsel -= TCOLS;
+            else if (code == HID_DOWN && tsel + TCOLS < ntp) tsel += TCOLS;
+            else if (code == HID_DOWN && tsel + 1 < ntp) tsel = ntp - 1;
+            else if (code == HID_PGUP) tsel = tsel >= 12 ? tsel - 12 : 0;
+            else if (code == HID_PGDN) tsel = tsel + 12 < ntp ? tsel + 12 : ntp - 1;
+            else if (code == HID_ENTER) {
+                pic_idx = tpics[tsel]; from_thumbs = true; state = ST_PICTURE;
+                if (!show_picture(pic_idx)) { from_thumbs = false; imgview_close(); thumbs_leave(); msg_show("%s", imgview_error()); }
+            }
+            else if (code == HID_ESC || code == HID_BACKSPACE || tc == 'v') { thumbs_leave(); break; }
+            thumbs_scroll_to_sel();
+            break;
+        }
         case ST_PICTURE: {
             iv_action_t act = imgview_key(code);
             if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; bsel = n; if (!show_picture(n)) { leave_picture(); msg_show("%s", imgview_error()); } } }
-            else if (act == IV_CLOSE) leave_picture();
+            else if (act == IV_CLOSE) { leave_picture(); from_thumbs = from_thumbs && state == ST_THUMBS; }
             break;
         }
         case ST_CONFIRM:
@@ -392,6 +523,26 @@ static void handle_touch(touch_event_t te) {
     int cw, ch;
     display_cell_size(&cw, &ch);
     if (state == ST_PICTURE) { if (imgview_touch(te) == IV_CLOSE) leave_picture(); return; }
+    if (state == ST_THUMBS) {   // drag to scroll under the finger, tap to open
+        static int x0, y0, off0; static bool moved;
+        if (te.type == TOUCH_DOWN) { x0 = te.x; y0 = te.y; off0 = toff; moved = false; }
+        else if (te.type == TOUCH_MOVE) {
+            if (abs(te.y - y0) > 10 || abs(te.x - x0) > 10) moved = true;
+            if (moved) {
+                int maxoff = ((ntp + TCOLS - 1) / TCOLS) * TCH - 320;
+                toff = off0 - (te.y - y0);
+                if (toff > maxoff) toff = maxoff;
+                if (toff < 0) toff = 0;
+            }
+        } else if (te.type == TOUCH_UP && !moved) {
+            int col = x0 / TCW, row = (y0 + toff) / TCH, i = row * TCOLS + col;
+            if (col < TCOLS && i >= 0 && i < ntp) {
+                tsel = i; pic_idx = tpics[i]; from_thumbs = true; state = ST_PICTURE;
+                if (!show_picture(pic_idx)) { from_thumbs = false; imgview_close(); thumbs_leave(); msg_show("%s", imgview_error()); }
+            }
+        }
+        return;
+    }
     if (te.type == TOUCH_DOWN) { start_y = te.y; return; }
     if (te.type == TOUCH_UP && abs(te.y - start_y) < 8 && state == ST_LIST) {
         int r = te.y / ch - 1;
@@ -432,9 +583,14 @@ app_exit_t files_app(QueueHandle_t q, QueueHandle_t tq) {
             if (state != ST_NOCARD && !sdcard_present()) { if (state == ST_PICTURE) imgview_close(); sdcard_unmount(); ejected = false; state = ST_NOCARD; cut_path[0] = 0; changed = true; }
             else if (state == ST_NOCARD && !ejected_hold() && sdcard_mount()) { snprintf(cwd, sizeof cwd, "%s", ROOT); browse(cwd); state = ST_LIST; ejected = false; changed = true; }
         }
-        if (changed || now - last_draw > 1000000) { draw(); last_draw = now; }
+        if (state == ST_THUMBS) {
+            if (changed) thumbs_draw();
+            else if (thumbs_step()) thumbs_draw();   // one more thumbnail is ready, the screen fills in as they come
+            last_draw = now;
+        } else if (changed || now - last_draw > 1000000) { draw(); last_draw = now; }
     }
-    if (state == ST_PICTURE) leave_picture();
+    if (state == ST_PICTURE) { from_thumbs = false; leave_picture(); }
+    if (state == ST_THUMBS) thumbs_leave();
     free(scr); free(back_buf);
     scr = back_buf = NULL;
     display_set_scrollbar(0, 0, 0);

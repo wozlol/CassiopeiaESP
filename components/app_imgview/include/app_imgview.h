@@ -15,3 +15,6 @@ const char *imgview_error(void);                  // why the last open failed, i
 // IV_NEXT and IV_PREV come when the whole picture is showing and an arrow is pressed. IV_CLOSE on any other key and on a long press.
 iv_action_t imgview_key(uint16_t code);
 iv_action_t imgview_touch(touch_event_t te);
+// A small picture for a thumbnail view: tw by th pixels, the middle of the picture cropped to fill it, panel ordered RGB565 from the heap.
+// Returns NULL when the file cannot be read as a picture. Do not call while a picture is open.
+uint16_t *imgview_thumb(const char *path, int tw, int th);

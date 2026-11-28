@@ -280,13 +280,17 @@ static bool decode_into(raster_t *r, int den) {
         esp_jpeg_image_output_t info;
         esp_err_t ie = esp_jpeg_get_image_info(&cfg, &info);
         if (ie != ESP_OK) return fail("That JPEG could not be read.");
-        cfg.outbuf_size = (uint32_t)info.width * info.height * 2 + 64;
+        // the decoder reports the full size even when it is asked for a shrunk copy, so the size of the copy is worked out here
+        int cw = (info.width + den - 1) / den, ch = (info.height + den - 1) / den;
+        cfg.outbuf_size = (uint32_t)cw * ch * 2 + 64;
         r->px = heap_caps_malloc(cfg.outbuf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!r->px) { ESP_LOGW(TAG, "jpeg %dx%d at 1/%d needs %u bytes, free block %u", fw, fh, den, (unsigned)cfg.outbuf_size, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)); return fail("Not enough memory for that picture."); }
         cfg.outbuf = (uint8_t *)r->px;
         esp_err_t de = esp_jpeg_decode(&cfg, &info);
         if (de != ESP_OK) { free(r->px); r->px = NULL; ESP_LOGW(TAG, "jpeg decode error %s", esp_err_to_name(de)); return fail("That JPEG could not be decoded."); }
-        r->w = info.width; r->h = info.height; r->den = den;
+        // the rows are as long as the decoder says now, it can differ by a pixel from a plain division
+        r->w = info.width > 0 && info.width <= cw ? info.width : (fw / den > 0 ? fw / den : cw); r->h = info.height > 0 && info.height <= ch ? info.height : (fh / den > 0 ? fh / den : ch); r->den = den;
+        ESP_LOGI(TAG, "jpeg at 1/%d: decoder says %dx%d, planned %dx%d", den, (int)info.width, (int)info.height, cw, ch);
         return true;
     }
     png_t p;
@@ -458,6 +462,87 @@ static void pan(int dxs, int dys) {   // in screen pixels
 // Presses and taps that piled up while a slow load was going are not meant as new ones.
 static bool piled_up(void) { return render_ms > 150 && esp_timer_get_time() - render_end_us < 400000; }
 
+// ---------- thumbnails ----------
+uint16_t *imgview_thumb(const char *path, int tw, int th) {
+    if (is_open) return NULL;
+    free_all();
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0 || st.st_size > MAX_FILE) return NULL;
+    src = heap_caps_malloc((size_t)st.st_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!src) return NULL;
+    FILE *f = fopen(path, "rb");
+    bool ok = f && fread(src, 1, (size_t)st.st_size, f) == (size_t)st.st_size;
+    if (f) fclose(f);
+    if (!ok) { free_all(); return NULL; }
+    src_len = (uint32_t)st.st_size;
+    uint16_t *out = NULL;
+    raster_t rr = {0};
+    bool general = false, progressive = false;
+    fw = fh = 0;
+    if (src_len > 8 && ((src[0] == 'B' && src[1] == 'M') || !memcmp(src, "GIF8", 4))) general = true;
+    else if (src_len > 8 && src[0] == 0xFF && src[1] == 0xD8) {
+        kind = K_JPEG;
+        for (uint32_t i = 2; i + 9 < src_len;) {
+            if (src[i] != 0xFF) { i++; continue; }
+            uint8_t m = src[i + 1];
+            if (m == 0xFF) { i++; continue; }
+            if (m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01) { i += 2; continue; }
+            uint32_t sl = ((uint32_t)src[i + 2] << 8) | src[i + 3];
+            if (m == 0xC2 || m == 0xC6 || m == 0xCA) progressive = true;
+            if (m == 0xC0 || m == 0xC1 || m == 0xC2) { fh = (src[i + 5] << 8) | src[i + 6]; fw = (src[i + 7] << 8) | src[i + 8]; break; }
+            i += 2 + sl;
+        }
+        if (fw < 1 || fh < 1) { free_all(); return NULL; }
+    } else {
+        png_t p;
+        if (!png_header(src, src_len, &p) || p.interlace) { free_all(); return NULL; }
+        if (p.depth != 1 && p.depth != 2 && p.depth != 4 && p.depth != 8 && p.depth != 16) { free_all(); return NULL; }
+        kind = K_PNG; fw = (int)p.w; fh = (int)p.h;
+    }
+    if (general) {
+        if (!open_general(3 * 1024 * 1024, false)) { free_all(); return NULL; }   // BMP and GIF are small, the one that is too big gets no thumbnail
+        rr = R[1]; R[1].px = NULL;
+        rr.den = 1;
+    } else if (progressive) {
+        int ow = 0, oh = 0, w = 0, h = 0;
+        char e[64];
+        rr.px = jpegdc_decode(src, src_len, &ow, &oh, &w, &h, e, sizeof e);
+        if (!rr.px) { free_all(); return NULL; }
+        rr.w = ow; rr.h = oh; rr.den = 8; fw = w; fh = h;
+    } else {
+        float cover = fmaxf((float)tw / fw, (float)th / fh);
+        int den = 1;
+        for (int i = 0; i < 6; i++) if (cover * DENS[i] <= 1.0f && !(kind == K_JPEG && DENS[i] > 8)) den = DENS[i];
+        if (!decode_into(&rr, den)) { free_all(); return NULL; }
+    }
+    // the middle of the picture, scaled to fill the thumbnail, boxes of source pixels averaged
+    out = heap_caps_malloc((size_t)tw * th * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (out) {
+        float cover = fmaxf((float)tw / fw, (float)th / fh);
+        float ww = tw / cover, hh = th / cover;          // the part of the picture that is kept, in picture pixels
+        float x0 = (fw - ww) / 2, y0 = (fh - hh) / 2;
+        for (int y = 0; y < th; y++) {
+            int ry0 = (int)((y0 + y / cover) / rr.den), ry1 = (int)((y0 + (y + 1) / cover) / rr.den);
+            if (ry1 <= ry0) ry1 = ry0 + 1;
+            for (int x = 0; x < tw; x++) {
+                int rx0 = (int)((x0 + x / cover) / rr.den), rx1 = (int)((x0 + (x + 1) / cover) / rr.den);
+                if (rx1 <= rx0) rx1 = rx0 + 1;
+                uint32_t sr = 0, sg = 0, sb = 0, cnt = 0;
+                for (int yy = ry0; yy < ry1 && yy < rr.h; yy++) for (int xx = rx0; xx < rx1 && xx < rr.w; xx++) {
+                    uint16_t p = rr.px[(size_t)yy * rr.w + xx];
+                    p = (uint16_t)((p >> 8) | (p << 8));
+                    sr += (p >> 11) & 31; sg += (p >> 5) & 63; sb += p & 31; cnt++;
+                }
+                uint16_t v = cnt ? (uint16_t)(((sr / cnt) << 11) | ((sg / cnt) << 5) | (sb / cnt)) : 0;
+                out[(size_t)y * tw + x] = (uint16_t)((v >> 8) | (v << 8));
+            }
+        }
+    }
+    free(rr.px);
+    free_all();
+    return out;
+}
+
 // ---------- the public side ----------
 void imgview_close(void) { free_all(); display_raw(false); is_open = false; }
 bool imgview_active(void) { return is_open; }
@@ -545,16 +630,22 @@ iv_action_t imgview_key(uint16_t code) {
 }
 
 iv_action_t imgview_touch(touch_event_t te) {
-    static int ix, iy, lx, ly;
+    static int ix, iy;
+    static float cx0, cy0;          // where the view was when the finger came down
     static int64_t it0;
-    static bool moved;
+    static bool moved, pending;
     int64_t tn = esp_timer_get_time();
-    if (te.type == TOUCH_DOWN) { ix = lx = te.x; iy = ly = te.y; it0 = tn; moved = false; }
+    if (te.type == TOUCH_DOWN) { ix = te.x; iy = te.y; cx0 = cx; cy0 = cy; it0 = tn; moved = false; pending = false; }
     else if (te.type == TOUCH_MOVE) {
         if (abs(te.x - ix) > 14 || abs(te.y - iy) > 14) moved = true;
-        if (moved && zi > 0 && !piled_up()) { label_low = true; pan(lx - te.x, ly - te.y); }
-        lx = te.x; ly = te.y;
-    } else if (te.type == TOUCH_UP && !moved) {
+        if (moved && zi > 0) {   // the picture stays under the finger, however many moves were skipped while a redraw ran
+            float z = zs[zi];
+            cx = cx0 - (te.x - ix) / z / fw;
+            cy = cy0 - (te.y - iy) / z / fh;
+            if (esp_timer_get_time() - render_end_us > 40000) { label_low = true; render(); pending = false; } else pending = true;
+        }
+    } else if (te.type == TOUCH_UP && moved && pending) { render(); pending = false; }
+    else if (te.type == TOUCH_UP && !moved) {
         if (tn - it0 > 700000) return IV_CLOSE;   // holding a finger down closes the picture
         if (piled_up()) return IV_NONE;
         label_low = true;
