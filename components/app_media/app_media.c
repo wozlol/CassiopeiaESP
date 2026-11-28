@@ -221,7 +221,7 @@ static char cwd[256] = ROOT;
 static int kind_of(const char *name) {
     const char *d = strrchr(name, '.');
     if (!d) return 0;
-    if (!strcasecmp(d, ".jpg") || !strcasecmp(d, ".jpeg")) return 1;
+    if (!strcasecmp(d, ".jpg") || !strcasecmp(d, ".jpeg") || !strcasecmp(d, ".png")) return 1;
     if (!strcasecmp(d, ".wav") || !strcasecmp(d, ".mp3")) return 2;
     return 0;
 }
@@ -531,7 +531,7 @@ static void open_entry(int i) {
     else if (x->kind == 1) {
         pic_idx = i;
         state = ST_PICTURE;
-        if (!show_picture(i)) { leave_picture(); msg_show(ST_BROWSE, "That picture could not be shown. Use baseline JPEG up to 6 MB."); }
+        if (!show_picture(i)) { leave_picture(); msg_show(ST_BROWSE, imgview_error()); }
     } else if (x->kind == 2) {
         if (play_start(i)) state = ST_PLAY; else msg_show(ST_BROWSE, "Sound did not start, check the speaker setup in the log.");
     }
@@ -592,7 +592,7 @@ static void handle_key(a11_event_t ev) {
             break;
         case ST_PICTURE: {
             iv_action_t act = imgview_key(code);
-            if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; if (!show_picture(n)) { leave_picture(); msg_show(ST_BROWSE, "That picture could not be shown. Use JPEG up to 6 MB."); } } }
+            if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; if (!show_picture(n)) { leave_picture(); msg_show(ST_BROWSE, imgview_error()); } } }
             else if (act == IV_CLOSE) leave_picture();
             break;
         }

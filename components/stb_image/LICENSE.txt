@@ -1,0 +1,1 @@
+stb_image.h is by Sean Barrett and others, public domain or MIT, see the end of include/stb_image.h.

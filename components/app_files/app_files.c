@@ -164,9 +164,9 @@ static void browse(const char *dir) {
     closedir(d);
     qsort(ents, nents, sizeof(ent_t), ent_cmp);
 }
-static bool is_jpeg(const char *n) {
+static bool is_jpeg(const char *n) {   // a picture the viewer can try: JPEG or PNG
     const char *e = strrchr(n, '.');
-    return e && (!strcasecmp(e, ".jpg") || !strcasecmp(e, ".jpeg"));
+    return e && (!strcasecmp(e, ".jpg") || !strcasecmp(e, ".jpeg") || !strcasecmp(e, ".png"));
 }
 static bool show_picture(int idx) {
     char p[400];
@@ -271,7 +271,7 @@ static void key_list(uint16_t code) {
     else if (code == HID_ENTER && nents && is_jpeg(ents[bsel].name)) {
         pic_idx = bsel;
         state = ST_PICTURE;
-        if (!show_picture(bsel)) { leave_picture(); msg_show("%s could not be shown. Pictures must be JPEG, up to 6 MB.", ents[bsel].name); }
+        if (!show_picture(bsel)) { leave_picture(); msg_show("%s", imgview_error()); }
     }
     else if (code == HID_ENTER && nents) msg_show("%s is not a picture. Open sounds in Media and documents in Reader.", ents[bsel].name);
     else if (code == HID_ESC || code == HID_BACKSPACE) go_up();
@@ -336,7 +336,7 @@ static void handle_key(a11_event_t ev) {
         case ST_MSG: state = ST_LIST; break;
         case ST_PICTURE: {
             iv_action_t act = imgview_key(code);
-            if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; bsel = n; if (!show_picture(n)) { leave_picture(); msg_show("%s could not be shown.", ents[n].name); } } }
+            if (act == IV_NEXT || act == IV_PREV) { int n = next_picture(pic_idx, act == IV_PREV ? -1 : 1); if (n != pic_idx) { pic_idx = n; bsel = n; if (!show_picture(n)) { leave_picture(); msg_show("%s", imgview_error()); } } }
             else if (act == IV_CLOSE) leave_picture();
             break;
         }
